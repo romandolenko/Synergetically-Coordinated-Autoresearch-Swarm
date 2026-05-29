@@ -16,5 +16,12 @@ queue/
 CLAUDE.md
 AGENTS.md
 
+# IDE / local tooling
+.idea/
+.claude/
+
 # Experimental code/artifacts
 dev/
+
+# SCAS simulator outputs
+sim_runs/
