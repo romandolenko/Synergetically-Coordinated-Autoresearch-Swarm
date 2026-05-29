@@ -1,0 +1,31 @@
+commit	val_bpb	memory_gb	status	description
+a1b2c3d	0.997900	44.0	keep	baseline
+b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
+c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
+d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+e5f6g7h	0.991100	44.5	keep	switch optimizer from Adam to AdamW
+f6g7h8i	0.989800	44.5	keep	add cosine LR schedule with 200 warmup steps
+g7h8i9j	0.992000	44.6	discard	try Lion optimizer with lr=3e-4
+h8i9j0k	0.988300	44.5	keep	replace Adam with Muon on hidden weights
+i9j0k1l	0.987200	45.1	keep	increase model depth to 12 layers
+j0k1l2m	0.991500	45.0	discard	switch to SwiGLU activation in FFN
+k1l2m3n	0.986800	45.2	keep	add dropout=0.1 on attention output
+l2m3n4o	0.985900	45.2	keep	weight_decay=0.05 on linear layers
+m3n4o5p	0.988100	45.2	discard	label smoothing 0.1
+n4o5p6q	0.985000	45.5	keep	add rotary positional embeddings
+o5p6q7r	0.984200	45.5	keep	tie input and output embeddings
+p6q7r8s	0.987800	45.6	discard	expand FFN from 4x to 8x
+q7r8s9t	0.983500	45.4	keep	increase attention heads to 16
+r8s9t0u	0.984900	45.4	discard	switch to pre-norm with RMSNorm
+s9t0u1v	0.982700	45.6	keep	stochastic depth 0.1
+t0u1v2w	0.982000	45.6	keep	gradient clipping at 1.0
+u1v2w3x	0.985000	45.5	discard	random masking augmentation 0.05
+v2w3x4y	0.981400	45.7	keep	add weight noise std=0.01 to FFN
+w3x4y5z	0.983300	45.8	discard	spectral normalization on QK projections
+x4y5z6a	0.000000	0.0	crash	widen FFN 12x and double depth (OOM)
+y5z6a7b	0.980800	45.7	keep	switch optimizer to LAMB with lr=1e-3
+z6a7b8c	0.980000	45.8	keep	SGD with momentum=0.95 and warmup
+a7b8c9d	0.982200	45.8	discard	increase width to 1024
+b8c9d0e	0.979300	45.9	keep	mixup with alpha=0.2
+c9d0e1f	0.978500	46.0	keep	cutmix augmentation prob=0.3
+d0e1f2g	0.978000	46.0	keep	combine cosine schedule with Sophia optimizer
