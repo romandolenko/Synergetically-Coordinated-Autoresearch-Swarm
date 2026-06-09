@@ -19,8 +19,9 @@ _CACHE_DIR = Path.home() / ".cache" / "scas"
 _CACHE_PATH = _CACHE_DIR / "embeddings.sqlite"
 
 
-def _key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _key(model_name: str, text: str) -> str:
+    # Keyed by (model, text) so switching models can't serve stale vectors.
+    return hashlib.sha256(f"{model_name}\x00{text}".encode("utf-8")).hexdigest()
 
 
 class Embedder:
@@ -47,7 +48,7 @@ class Embedder:
             self._model = SentenceTransformer(self._model_name)
 
     def embed(self, text: str) -> np.ndarray:
-        k = _key(text)
+        k = _key(self._model_name, text)
         row = self._conn.execute(
             "SELECT vec FROM embeddings WHERE key = ?", (k,)
         ).fetchone()

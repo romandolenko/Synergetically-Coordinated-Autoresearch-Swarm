@@ -1,5 +1,16 @@
 # SCAS — SCT Dynamical Law vs Engineered Heuristic (head-to-head)
 
+> **⚠ Update (2026-06-09): the SCT numbers in §2–§5 are superseded by §9.** A
+> code review found the `SCTCoordinator`'s forward-Euler integration was
+> **degenerate at `coupling_T = 1.0`** (snaps to the drive — zero memory, i.e.
+> the §2 table's "dynamical law" arm actually ran the steady-state gate) and
+> **unstable for `coupling_T < 1`** (the T=0.1/0.3 points of the §4 sweep are
+> numerical artifacts). The integrator is fixed (exact exponential update) and
+> everything is rerun in **§9**, including a fresh-seed confirmation of the
+> heuristic headline. Qualitative conclusions survive — except §4's "monotone
+> then saturates" knob reading, which was entirely an artifact (the fixed law
+> shows **no** T-response). §2–§8 are kept as-is for the record.
+
 > Built in response to the review concern that (a) the committed "synergetic
 > control law" is only the *steady-state* algebraic gate — the dynamics
 > `T·ψ̇ + ψ = 0` are never integrated (`design.md` §5) — and (b) the variant that
@@ -304,3 +315,162 @@ uv run python -m scas.sim --paired-seeds 10
 Run dirs: `compare-laws-N20-20260528T235034` (4-way with hybrid),
 `compare-laws-N20-20260528T233700` (initial 2-law), `sweep-T5-N10-20260528T233752`;
 `sim_runs/hybrid_psi0_sweep.json` (psi_0 tradeoff).
+
+## 9. Integrator fix and post-fix rerun (2026-06-09) — supersedes §2–§5 SCT numbers
+
+### 9a. The bug
+
+`SCTCoordinator` integrated both relaxations with forward Euler,
+`x += (dt/T)(u − x)` with `dt = 1`. For the linear relaxation `T·ẋ = u − x`
+this update has error multiplier `(1 − dt/T)` per step, so:
+
+- **`T = 1` (the §2 operating point): multiplier 0 — `ψ = u` and `c = z*`
+  exactly.** Zero memory, zero relaxation: the "genuine dynamical law" arm in §2
+  was actually the steady-state algebraic gate with a retuned sigmoid
+  (`psi_0=0.5`, `alpha_temp=0.3`). Its cohesion lift was real but the credit to
+  "the relaxing order parameter pulls group-mates together over time" was wrong
+  — nothing was relaxing.
+- **`T < 1` (the §4 sweep's 0.1 and 0.3 points): |multiplier| > 1 — unstable.**
+  ψ oscillates with growing amplitude (α slams between 0 and 1); the attractor
+  is rescued only by sphere renormalisation. The low inter/intra at T=0.1/0.3 in
+  §4 was the oscillation destroying cohesion, not the law responding to the knob.
+- **`T > 1`: valid** — the only genuinely dynamical regime the pre-fix data had.
+
+**Fix:** the exact exponential update, the closed-form solution of the
+relaxation over one step — stable for every `T > 0`, tracking `u` as `T → 0`
+and freezing as `T → ∞`:
+
+```
+decay = exp(-dt / coupling_T)
+ψ ← u  + (ψ − u)  · decay
+c ← z* + (c − z*) · decay      (then renormalised to the unit sphere)
+```
+
+Unit tests now pin this down (`scas/law_tests.py`): ψ approaches a constant
+drive monotonically without overshoot for `T ∈ {0.1, 0.5, 1, 3, 10}`, and the
+attractor relaxes monotonically on the sphere (snaps for small T, gradual for
+large T). The steady-state `Coordinator` is untouched; committed defaults still
+reproduce byte-identically (44.8 / 1.39 / 2.0948; validator + law tests 35/35).
+
+### 9b. Post-fix head-to-head (same protocol as §2, plus the independent-search control as a sixth arm)
+
+N=20 seeds, G=3, K'=5, M=3/group, coupling_T=1.0, psi_0=0.5, alpha_temp=0.3
+(now the auto-applied SCT defaults). Run dir `compare-laws-N20-20260609T183942`.
+
+| Arm | steps→80% | AC-B2 marginal vs partition | AC-B3 inter/intra | AC-B3 lift | best_val Δ |
+| --- | --- | --- | --- | --- | --- |
+| random baseline | 65.5 | — (control) | — | — | — |
+| partition (fair control) | 65.0 | 1.00 (control) | 1.90 | 0.00 (control) | — |
+| **independent search (new arm)** | 63.1 | 1.03 [0.74, 1.40] | 1.90 [1.88, 1.93] | 0.00 [−0.02, 0.03] | +0.0010 |
+| **SCT dynamical law** | 100.8 | **0.64 [0.38, 1.06]** ✗ | 2.94 [2.87, 3.00] ✓ | **+1.04 [0.97, 1.11]** ✓ | −0.0033 |
+| **SCT + novelty search (hybrid)** | 47.8 | **1.36 [0.87, 2.33]** ✗ | 3.08 [3.03, 3.13] ✓ | **+1.18 [1.14, 1.23]** ✓ | −0.0023 |
+| **Engineered heuristic** | 33.5 | **1.94 [1.22, 3.05]** ✗ | 4.23 [4.14, 4.32] ✓ | **+2.33 [2.24, 2.42]** ✓ | −0.0022 |
+
+Direct head-to-heads: heuristic 3.00× [1.82, 4.68] faster than pure SCT
+(pre-fix: 2.48×), 1.42× [1.02, 1.90] faster than the hybrid (pre-fix: 1.58×).
+
+**What changed with real dynamics at T=1:**
+
+- **Pure SCT coverage got *worse*** (83 → 101 steps, marginal 0.78 → **0.64**).
+  With genuine ψ-memory, exploit episodes persist (ψ decays over ~T steps
+  instead of resetting), so the law re-visits attractor neighbourhoods even
+  more. The §3 structural argument strengthens: the law cannot beat a
+  novelty-seeking search at coverage.
+- **The hybrid improved** (53 → 47.8, marginal 1.23 → **1.36**) — memory makes
+  the α-schedule less jittery, so explore phases are spent on the farthest-point
+  search more coherently. Still does not clear 1.5 (CI-low 0.87).
+- **Emergent cohesion survives the fix** (+1.04 / +1.18 vs pre-fix +1.11 /
+  +1.22) — and is now attributable to actual dynamics, not the degenerate snap.
+  This is the corrected version of §3's headline finding, and it stands.
+- **The "search alone hurts" reading softens.** §6c of `results-review.md`
+  (N=10) reported the independent farthest-point control at 0.86× (slower than
+  uniform). On N=20 same-seed footing it is **1.03× [0.74, 1.40] — a wash**, not
+  a harm. The decomposition still attributes the heuristic's speedup to
+  coordination (1.94 vs 1.03), but the search-alone penalty claim should be
+  retired.
+- The heuristic arm is unchanged by construction (33.5 ≈ 33.6; it never used
+  the SCT integrator).
+
+### 9c. Post-fix AC-B4 — the dynamical law has *no* coupling_T response
+
+Same sweep as §4 (N=10, M=3, psi_0=0.5, alpha_temp=0.3), fixed integrator.
+Run dir `sweep-T5-N10-20260609T183943`.
+
+| coupling_T | 0.1 | 0.3 | 1.0 | 3.0 | 10.0 |
+| --- | --- | --- | --- | --- | --- |
+| inter/intra (pre-fix, artifact) | 1.37 | 1.50 | 2.97 | 2.94 | 2.92 |
+| **inter/intra (fixed)** | **2.97** | **3.09** | **2.87** | **2.82** | **2.94** |
+
+Kendall τ_agg = **−0.40**, τ_flat = −0.15 — **AC-B4 fails for the dynamical
+law, and not marginally**. With stable integration, separation is flat (~2.9)
+across two decades of T; the pre-fix "monotone within its responsive regime,
+saturating above" reading was entirely the artifact (the rising left edge was
+the unstable oscillation destroying cohesion at T<1). Coverage is likewise flat
+(~106–115 steps at every T). **The single-knob promise holds only for the
+steady-state law**, where `coupling_T` is a sigmoid temperature (τ = +1.000);
+the dynamical law's relaxation timescale does not translate into a usable
+diversity dial at this operating point — α's *equilibrium* (set by `psi_0` /
+`alpha_temp`) determines behaviour, and T only sets how fast ψ gets there,
+which a 200-step run barely notices.
+
+### 9d. Fresh-seed confirmation — the heuristic's AC-B2 pass does not replicate out-of-sample
+
+All tuning across `results-review.md` §6b–§6e and this doc used seeds 0..N−1.
+The headline heuristic config (M=3, K'=5, anneal, N=20) was rerun once on
+never-touched seeds **100–119** (`--seed-offset 100`, run dir
+`paired-N20-20260609T183944`):
+
+| Metric | Tuning seeds 0–19 | **Fresh seeds 100–119** | Bar |
+| --- | --- | --- | --- |
+| AC-B2 control-law marginal | 1.94 | **1.42 ✗** | ≥ 1.5 |
+| AC-B3 lift vs fair control | +2.33 | **+2.40 ✓** | ≥ 0.5 |
+| AC-B1' best_val Δ | −0.0022 | −0.0038 | within noise |
+
+**Finding.** The AC-B3 lift replicates (expected — the anneal scripts it). The
+**AC-B2 marginal does not** (1.42 < 1.5), landing inside the bootstrap CI the
+N=20 tuning run already warned about ([1.22, 3.05]). The "robust 1.94×" of
+§6c/§6d should be read as ~1.4–1.9 with seed-level variance straddling the bar.
+The variant's coverage advantage over the fair control is real (CI excludes ≤1
+on neither run decisively, but both points are well above 1); the *1.5×
+threshold claim* specifically is not confirmed out-of-sample.
+
+### 9e. Corrected net conclusions (replaces §5's table where they differ)
+
+1. **Emergent cohesion is the SCT law's genuine contribution and survives the
+   fix** (+1.04 pure / +1.18 hybrid, CI-solid, no scripting) — now demonstrated
+   with actual integrated dynamics rather than a degenerate snap.
+2. **Coverage remains a search property, more starkly than before**: pure law
+   0.64× (actively hurts), hybrid 1.36×, heuristic 1.94× — and the heuristic's
+   edge over the hybrid narrowed (1.42×) but persists.
+3. **The dynamical law has no working coupling_T knob** (AC-B4 fail, flat
+   response). Tunable behaviour lives in `psi_0`/`alpha_temp` (the §6 Pareto
+   frontier), not in the relaxation timescale.
+4. **No arm clears the 1.5× coverage bar robustly**: the heuristic's 1.94× has
+   CI-low 1.22 *and* drops to 1.42 on fresh seeds. The honest AC-B2 status for
+   every coordination mechanism tested is "real advantage over the fair
+   control, threshold not robustly met."
+5. The heuristic's coverage numbers are additionally **menu-dependent** (it
+   pre-embeds the entire finite candidate pool; see `results-review.md` §6c
+   scope limit) and transfer least readily to a live phase.
+
+### 9f. Reproducibility (post-fix)
+
+```powershell
+# All law tests incl. integrator-stability regressions (35 tests)
+uv run pytest scas/law_tests.py scas/validator_tests.py -q
+
+# Post-fix head-to-head (psi_0=0.5 / alpha_temp=0.3 are now auto-defaults for SCT arms)
+uv run python -m scas.sim --compare-laws --paired-seeds 20 --K 3 --K-prime 5 --agents-per-group 3
+
+# Post-fix AC-B4 sweep under the SCT law
+uv run python -m scas.sim --sweep-T "0.1,0.3,1.0,3.0,10.0" --sct --paired-seeds 10 --agents-per-group 3
+
+# Fresh-seed confirmation of the heuristic headline (seeds 100-119)
+uv run python -m scas.sim --paired-seeds 20 --seed-offset 100 --agents-per-group 3 --anneal
+
+# Committed defaults unchanged (44.8 / 1.39 / 2.0948)
+uv run python -m scas.sim --paired-seeds 10
+```
+
+Run dirs: `compare-laws-N20-20260609T183942`, `sweep-T5-N10-20260609T183943`,
+`paired-N20-20260609T183944`, `paired-N10-20260609T183705` (regression check).

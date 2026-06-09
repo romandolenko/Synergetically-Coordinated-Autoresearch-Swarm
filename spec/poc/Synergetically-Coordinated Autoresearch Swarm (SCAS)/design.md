@@ -181,6 +181,8 @@ One run produces a directory `sim_runs/<run_id>/`:
 - `landscape.json` — ground-truth minima (`mu_k`, `sigma_k`, `depth_k`) for downstream "distinct minima visited" analysis
 - `summary.json` — terminal metrics: `best_val_bpb`, `inter_group_dist`, `intra_group_dist`, `distinct_minima_visited`, `n_violations`, **`first_visit_steps`** (sorted list of agent-step indices at which each new minimum was first visited; length ≤ K'), **`steps_to_coverage`** (`{"0.5": int|null, "0.8": int|null, "1.0": int|null}` — agent-step at which each coverage fraction was reached; null if never reached within the budget)
 
+  **Metric caveat (`intra_group_dist`).** Intra is the mean distance of *every accepted embedding over the whole run* to the group's **final** attractor — it is run-averaged, not end-state. Early-exploration samples are scored against an attractor that did not exist yet, and arms that spend late steps near the final attractor (e.g. the `--anneal` converge phase) are systematically favored. Read AC-B3 lifts with this in mind; an end-state-window variant (e.g. last 25% of steps) would isolate terminal cohesion.
+
 A sweep run produces N sub-runs plus a top-level `sweep.json` linking them.
 
 ## 11. Plotting (AC-E3)

@@ -193,6 +193,15 @@ gain comes from the **shared coverage memory + exploit-gating**, i.e. coordinati
 | independent farthest-point (search only) | 72.4 | 0.86 (search alone hurts) |
 | coordinated farthest-point (shared + gated) | 40.5 | **1.54** |
 
+**Scope limit — the win is menu-dependent.** The embedding-repulsion machinery
+pre-embeds the *entire finite candidate pool* (~100 strings/category) and the
+minima are sampled from that same pool, so farthest-point selection over a fully
+known menu is close to a greedy max-coverage algorithm run against the answer
+key. A live LLM phase cannot enumerate and pre-embed its hypothesis space; the
+heuristic's coverage speedup therefore transfers *less* readily than the SCT
+arms (which need only an attractor and a similarity query). Treat 1.94× as an
+upper bound specific to closed candidate menus.
+
 **Verdict.** AC-B2's control-law marginal **passes at K'=5** (robustly: 1.94 at N=20)
 and the gain is attributable to coordination. It **fails at K'=10** (1.30) — the
 predicted "crowding under partition" when minima outnumber categories enough that
@@ -277,6 +286,21 @@ of distinct optima and the coordination law delivers diversity-with-selective-
 convergence. This removes the last scope caveat from §6c–§6d.
 
 Run dirs: `paired-N10-20260528T203032` (G=6 N=10) plus the G=4/5 and G=6-N=20 sweep.
+
+## 6f. Fresh-seed confirmation (2026-06-09) — §6c/§6d's "robust" AC-B2 pass does not replicate
+
+Every run in §6b–§6e used seeds 0..N−1 — the same seeds the variant pipeline was
+*tuned* on. A one-shot confirmation of the §6d headline config (M=3, K'=5,
+anneal, N=20) on never-touched seeds 100–119 (`--seed-offset 100`) gives
+**AC-B2 marginal 1.42 (< 1.5)** vs 1.94 in-sample, while the AC-B3 lift
+replicates (+2.40, scripted by the anneal as documented). So §6c/§6d's "robust"
+label is withdrawn: the variant's coverage advantage over the fair control is
+real, but the 1.5× threshold claim is in-sample only. Two related revisions from
+the same review pass: (a) the §6c "search alone hurts" control (0.86× at N=10)
+re-measured at N=20 inside `--compare-laws` is **1.03× [0.74, 1.40] — a wash,
+not a harm** (the decomposition conclusion stands: coordination, not search,
+carries the speedup); (b) the SCT integrator bug and its consequences are in
+[`results-laws.md`](results-laws.md) §9. Run dir: `paired-N20-20260609T183944`.
 
 ## 7. Reproducibility
 

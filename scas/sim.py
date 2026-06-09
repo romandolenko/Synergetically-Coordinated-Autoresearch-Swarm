@@ -17,6 +17,7 @@ Per-run output bundle (design §10):
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import time
 from pathlib import Path
@@ -50,8 +51,13 @@ CoordLike = Union[
 ]
 
 
+_RUN_COUNTER = itertools.count()
+
+
 def _make_run_id(seed: int, tag: str) -> str:
-    return f"{tag}-seed{seed}-{time.strftime('%Y%m%dT%H%M%S')}"
+    # Per-process counter suffix: timestamps have 1 s resolution, so two runs of
+    # the same tag+seed within a second would otherwise share a directory.
+    return f"{tag}-seed{seed}-{time.strftime('%Y%m%dT%H%M%S')}-{next(_RUN_COUNTER):03d}"
 
 
 def _mean_pairwise(vectors: list[np.ndarray]) -> float:
@@ -75,16 +81,6 @@ def _intra_group_dist(
             continue
         ds.append(float(np.linalg.norm(e - attr)))
     return float(np.mean(ds)) if ds else 0.0
-
-
-def _distinct_minima_visited(
-    embeddings_log: list[tuple[int | None, np.ndarray]],
-    landscape: Landscape,
-    sigma_fraction: float = 0.5,
-) -> int:
-    return sum(
-        1 for v in _first_visit_steps(embeddings_log, landscape, sigma_fraction) if v is not None
-    )
 
 
 def _first_visit_steps(
@@ -570,13 +566,14 @@ def _run_paired_at_T(
     alpha_temp: float = 1.0,
     agents_per_group: int = 1,
     sct_search: bool = False,
+    seed_offset: int = 0,
 ) -> tuple[dict, dict, Path]:
     """Run paired SCAS+baseline at a fixed T; return (scas_agg, baseline_agg, dir)."""
     sub = parent / f"T{coupling_T}"
     sub.mkdir(parents=True, exist_ok=True)
     scas_dirs: list[Path] = []
     baseline_dirs: list[Path] = []
-    for seed in range(n_seeds):
+    for seed in range(seed_offset, seed_offset + n_seeds):
         scas_dirs.append(
             _run_one(seed, "scas", K, K_prime, steps, coupling_T, sub, embedder,
                      w_p=w_p, psi_0=psi_0, sct=sct, alpha_temp=alpha_temp,
@@ -606,6 +603,7 @@ def _run_sweep_T(args: argparse.Namespace, T_values: list[float]) -> Path:
             parent, n, args.K, args.K_prime, args.steps, T, embedder,
             w_p=args.w_p, psi_0=args.psi_0, sct=args.sct, alpha_temp=args.alpha_temp,
             agents_per_group=args.agents_per_group, sct_search=args.sct_search,
+            seed_offset=args.seed_offset,
         )
         s80_scas = scas_agg["mean_steps_to_80pct_coverage"]
         s80_base = baseline_agg["mean_steps_to_80pct_coverage"]
@@ -683,7 +681,7 @@ def _run_paired(args: argparse.Namespace) -> Path:
     # builds on shared embedding-repulsion (explore early, converge late).
     er = args.embedding_repulsion or args.independent_repulsion or args.anneal
     shared = not args.independent_repulsion
-    for seed in range(n):
+    for seed in range(args.seed_offset, args.seed_offset + n):
         scas_dirs.append(
             _run_one(seed, "scas", args.K, args.K_prime, args.steps, args.coupling_T,
                      parent, embedder, w_p=args.w_p, psi_0=args.psi_0,
@@ -707,6 +705,7 @@ def _run_paired(args: argparse.Namespace) -> Path:
     headline = {
         "paired_dir": str(parent),
         "n_seeds": n,
+        "seed_offset": args.seed_offset,
         "w_p": args.w_p,
         "psi_0": args.psi_0,
         "agents_per_group": apg,
@@ -794,13 +793,19 @@ def _compare_laws(args: argparse.Namespace) -> Path:
         dirs = [
             _run_one(seed, mode, args.K, args.K_prime, args.steps, args.coupling_T,
                      sub, embedder, agents_per_group=apg, **kw)
-            for seed in range(n)
+            for seed in range(args.seed_offset, args.seed_offset + n)
         ]
         agg_mode = mode if mode in ("baseline", "partition") else "scas"
         return _aggregate(dirs, sub / "agg.json", agg_mode)
 
     baseline = _arm("baseline", "baseline")
     partition = _arm("partition", "partition")
+    # Search-without-coordination control (results-review §6c): same
+    # farthest-point search as the heuristic but per-agent memory, no gating,
+    # no anneal. Lives in this table so the search/coordination decomposition
+    # is measured on the same seeds as the law arms.
+    independent = _arm("independent", "scas", embedding_repulsion=True,
+                       shared_coverage=False)
     sct = _arm("sct", "scas", sct=True, w_p=args.w_p, psi_0=args.psi_0,
                alpha_temp=args.alpha_temp)
     sct_search = _arm("sct_search", "scas", sct=True, sct_search=True, w_p=args.w_p,
@@ -815,20 +820,27 @@ def _compare_laws(args: argparse.Namespace) -> Path:
         return np.array([float(r[key]) for r in agg["per_seed"]], dtype=float)
 
     base_s, part_s = steps80(baseline), steps80(partition)
-    sct_s, hyb_s, heur_s = steps80(sct), steps80(sct_search), steps80(heuristic)
+    ind_s, sct_s = steps80(independent), steps80(sct)
+    hyb_s, heur_s = steps80(sct_search), steps80(heuristic)
     part_ioi = col(partition, "inter_over_intra")
-    sct_ioi, hyb_ioi, heur_ioi = (col(a, "inter_over_intra") for a in (sct, sct_search, heuristic))
+    ind_ioi, sct_ioi, hyb_ioi, heur_ioi = (
+        col(a, "inter_over_intra") for a in (independent, sct, sct_search, heuristic)
+    )
     base_b = col(baseline, "best_val_bpb")
-    sct_b, hyb_b, heur_b = (col(a, "best_val_bpb") for a in (sct, sct_search, heuristic))
+    ind_b, sct_b, hyb_b, heur_b = (
+        col(a, "best_val_bpb") for a in (independent, sct, sct_search, heuristic)
+    )
 
     ratio = lambda num, den: np.mean(num) / np.mean(den)   # noqa: E731
     diff = lambda x, y: np.mean(x) - np.mean(y)            # noqa: E731
 
-    report: dict = {"compare_dir": str(parent), "n_seeds": n, "agents_per_group": apg,
+    report: dict = {"compare_dir": str(parent), "n_seeds": n, "seed_offset": args.seed_offset,
+                    "agents_per_group": apg,
                     "K": args.K, "K_prime": args.K_prime, "coupling_T": args.coupling_T,
                     "psi_0": args.psi_0, "alpha_temp": args.alpha_temp, "w_p": args.w_p,
                     "arms": {}}
     arm_data = (
+        ("independent", ind_s, ind_ioi, ind_b),
         ("sct", sct_s, sct_ioi, sct_b),
         ("sct_search", hyb_s, hyb_ioi, hyb_b),
         ("heuristic", heur_s, heur_ioi, heur_b),
@@ -873,14 +885,15 @@ def _compare_laws(args: argparse.Namespace) -> Path:
           f"{'-':>20} {'-':>18} {'-':>14}")
     print(f"{'partition':<10} {np.mean(part_s):>11.1f} {'1.00 (control)':>22} "
           f"{np.mean(part_ioi):>20.2f} {'0.00 (control)':>18} {'-':>14}")
-    for name in ("sct", "sct_search", "heuristic"):
+    for name in ("independent", "sct", "sct_search", "heuristic"):
         a = report["arms"][name]
-        print(f"{name:<10} {a['mean_steps_to_80pct']:>11.1f} "
+        print(f"{name:<11} {a['mean_steps_to_80pct']:>10.1f} "
               f"{_ci(a['ac_b2_marginal_vs_partition']):>22} "
               f"{_ci(a['ac_b3_inter_over_intra']):>20} "
               f"{_ci(a['ac_b3_lift_vs_partition']):>18} "
               f"{a['ac_b1_best_val_delta_vs_baseline']['point']:>+14.4f}")
-    print(f"\nsct=pure law (global explore); sct_search=law gating farthest-point "
+    print(f"\nindependent=farthest-point search w/o coordination (control); "
+          f"sct=pure law (global explore); sct_search=law gating farthest-point "
           f"search (no anneal); heuristic=search+gating+anneal.")
     print(f"SCT-vs-heuristic coverage ratio:    {h2h[0]:.2f} [{h2h[1]:.2f}, {h2h[2]:.2f}] (>1 => heuristic faster)")
     print(f"hybrid-vs-heuristic coverage ratio: {hyb_vs_heur[0]:.2f} "
@@ -924,13 +937,20 @@ def _parse_args() -> argparse.Namespace:
         help="loop seeds 0..N-1, run scas + baseline each (also controls sweep seed count)",
     )
     p.add_argument(
+        "--seed-offset", type=int, default=0, dest="seed_offset",
+        help="start multi-seed loops at this seed (fresh-seed confirmation runs: "
+             "all tuning used seeds 0..N-1, so confirm on e.g. --seed-offset 100)",
+    )
+    p.add_argument(
         "--w-p", type=float, default=W_P, dest="w_p",
         help=f"perf-gap weight in psi (default {W_P}; >0 makes the coordinator "
              "performance-aware — the committed default is performance-blind)",
     )
     p.add_argument(
-        "--psi-0", type=float, default=PSI_0, dest="psi_0",
-        help=f"sigmoid center for alpha (default {PSI_0})",
+        "--psi-0", type=float, default=None, dest="psi_0",
+        help=f"sigmoid center for alpha (default {PSI_0}; SCT arms default to 0.5 — "
+             "the committed value was tuned for the string proposer and squashes "
+             "the law's alpha, see results-laws.md §1)",
     )
     p.add_argument(
         "--no-partition-control", action="store_true", dest="no_partition_control",
@@ -971,9 +991,9 @@ def _parse_args() -> argparse.Namespace:
              "attractor order parameter) with the law-driven embedding proposer",
     )
     p.add_argument(
-        "--alpha-temp", type=float, default=1.0, dest="alpha_temp",
+        "--alpha-temp", type=float, default=None, dest="alpha_temp",
         help="sigmoid sharpness for alpha in the SCT law (separate from coupling_T, "
-             "which is the relaxation timescale; default 1.0)",
+             "which is the relaxation timescale; default 1.0, SCT arms default 0.3)",
     )
     p.add_argument(
         "--sct-search", action="store_true", dest="sct_search",
@@ -981,13 +1001,46 @@ def _parse_args() -> argparse.Namespace:
              "search over shared group coverage instead of global-uniform explore "
              "(no exploit cap, no anneal). Implies --sct.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.sct_search:
+        args.sct = True  # the hybrid is the SCT law gating a novelty search
+
+    # Guard the flag matrix: _run_one's proposer branches have a fixed priority
+    # (embedding-repulsion > sct > string proposer), so silently combining them
+    # would run an undocumented hybrid and misattribute results.
+    heuristic_flags = [
+        flag
+        for flag, on in (
+            ("--embedding-repulsion", args.embedding_repulsion),
+            ("--independent-repulsion", args.independent_repulsion),
+            ("--anneal", args.anneal),
+        )
+        if on
+    ]
+    if args.sct and heuristic_flags:
+        p.error(f"--sct/--sct-search cannot combine with {' '.join(heuristic_flags)}: "
+                "the law and the engineered heuristic are separate arms "
+                "(use --compare-laws to run both)")
+    if args.coverage_coupling and (heuristic_flags or args.sct):
+        p.error("--coverage-coupling (slot-space, results-review §6b) cannot combine "
+                "with embedding-space variants or --sct")
+    if args.independent_repulsion and args.anneal:
+        p.error("--anneal requires shared group coverage; "
+                "--independent-repulsion is the uncoordinated control")
+
+    # SCT-aware defaults: the committed psi_0=2.0 / alpha_temp=1.0 were tuned for
+    # the string proposer; under the law-driven embedding proposer they squash
+    # alpha (~0.19). compare-laws runs SCT arms, so it gets the tuned defaults too.
+    sct_context = args.sct or args.compare_laws
+    if args.psi_0 is None:
+        args.psi_0 = 0.5 if sct_context else PSI_0
+    if args.alpha_temp is None:
+        args.alpha_temp = 0.3 if sct_context else 1.0
+    return args
 
 
 def main() -> None:
     args = _parse_args()
-    if args.sct_search:
-        args.sct = True  # the hybrid is the SCT law gating a novelty search
     if args.all_experiments:
         if args.paired_seeds <= 0:
             args.paired_seeds = 10

@@ -174,14 +174,22 @@ class SCTCoordinator:
     """Genuine synergetic dynamics — the dynamical-systems law the steady-state
     ``Coordinator`` only approximates.
 
-    Two first-order relaxations are integrated explicitly (forward Euler, one
-    ``dt`` per observation), both sharing the single timescale ``coupling_T``:
+    Two first-order relaxations are integrated with the exact exponential
+    update (one ``dt`` per observation), both sharing the single timescale
+    ``coupling_T``. The original forward-Euler step ``x += (dt/T)(u - x)`` was
+    degenerate at ``T = dt`` (snaps to ``u`` — zero memory, reduces to the
+    steady-state ``Coordinator``) and unstable for ``T < dt`` (the error
+    multiplier ``1 - dt/T`` exceeds 1 in magnitude, so psi oscillates and
+    diverges). The exponential integrator ``x ← u + (x - u)·exp(-dt/T)`` is the
+    closed-form solution of ``T·ẋ = u - x`` over one step: stable for every
+    ``T > 0``, tracking ``u`` as ``T → 0`` and freezing as ``T → ∞``.
 
       * **Group attractor as a continuous order parameter.** Instead of snapping
         the attractor to the best card's embedding, it relaxes toward the running
         group-best ``z*_g``::
 
             coupling_T * ċ_g = z*_g - c_g
+            c_g ← z*_g + (c_g - z*_g) * exp(-dt / coupling_T)
 
         renormalised to the unit sphere (MiniLM embeddings are unit-norm). The
         consensus is a slow order parameter, not an instantaneous argmax.
@@ -191,7 +199,7 @@ class SCTCoordinator:
         memory of past mismatch instead of being recomputed from scratch::
 
             u_i  = w_d * dist(z_i, c_g) + w_p * max(0, val_bpb_i - val_bpb_g_best)
-            ψ_i ← ψ_i + (dt / coupling_T) * (u_i - ψ_i)
+            ψ_i ← u_i + (ψ_i - u_i) * exp(-dt / coupling_T)
 
       ``alpha_i = sigmoid((psi_i - psi_0) / alpha_temp)`` in [0, 1] then gates the
       proposer's exploit-vs-explore mix.
@@ -267,12 +275,12 @@ class SCTCoordinator:
             self._best_emb[g] = embedding.copy()
 
         z_star = self._best_emb[g]
-        r = self.dt / self.coupling_T
+        decay = math.exp(-self.dt / self.coupling_T)
         if g not in self.state.attractors:
             c = z_star.copy()
         else:
             c = self.state.attractors[g]
-            c = c + r * (z_star - c)
+            c = z_star + (c - z_star) * decay
             norm = float(np.linalg.norm(c))
             if norm > 0:
                 c = c / norm
@@ -282,7 +290,7 @@ class SCTCoordinator:
             embedding, c, val_bpb, self.state.group_best_val_bpb[g], self.w_d, self.w_p
         )
         psi_prev = self.state.psi.get(card.agent_id)
-        psi = u if psi_prev is None else psi_prev + r * (u - psi_prev)
+        psi = u if psi_prev is None else u + (psi_prev - u) * decay
         self.state.psi[card.agent_id] = psi
         self.state.alpha[card.agent_id] = compute_alpha(psi, self.alpha_temp, self.psi_0)
         return improved
