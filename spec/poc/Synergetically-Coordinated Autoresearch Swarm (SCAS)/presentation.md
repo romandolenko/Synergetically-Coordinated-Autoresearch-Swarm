@@ -1,7 +1,7 @@
 # SCAS — Synergetically-Coordinated Autoresearch Swarm
 ## POC presentation
 
-> A POC for applying Synergetic Control Theory (SCT) to a massively-parallel autoresearch swarm. Validated offline; simulator only; no GPUs, no LLM agents.
+> A POC for applying Synergetic Control Theory (SCT) to a massively-parallel autoresearch swarm. Simulator only; no GPUs, no LLM agents. **Status (post-review, 2026-06-09): mixed.** The engineering, safety envelope, and reproducibility hold; the headline behavioral claims, measured against a fair control, are weaker than first reported — see Part 4. Full audit trail: [`results.md`](results.md) → [`results-review.md`](results-review.md) → [`results-laws.md`](results-laws.md).
 
 ---
 
@@ -123,6 +123,8 @@ where:
 
 This is the synergetic dynamics `T·ψ̇ + ψ = 0` collapsed to its steady-state interpretation. α is the agent's **coupling weight** for the next step: how strongly to track the group leader vs. explore globally.
 
+(A second coordinator, `SCTCoordinator` behind `--sct`, integrates the dynamics for real — ψ and the attractor relax exponentially with timescale `coupling_T` instead of being recomputed each step. It exists to test whether the *dynamical* content of the law adds anything over this algebraic gate; Part 4 has the answer.)
+
 ### 3.7 The mix proposer
 
 The synthetic proposer takes `category`, `target` (the group attractor's card text), `avoid` (other groups' attractor texts), and `alpha`. Per call:
@@ -163,9 +165,11 @@ Before any commit is accepted into the coordinator, `validate(commit, recent_fai
 
 Any failure ⇒ reject with a non-empty reason; agent has to revert. This is the **invariant-manifold safety envelope** in code.
 
-### 3.10 The independent-walkers baseline
+### 3.10 The baselines: independent walkers, and the fair partition control
 
-`scas/baselines.py` provides a **NullCoordinator** with the same interface as the real coordinator but `alpha = 0` for everyone, no group structure, no attractor updates. Each baseline agent picks a random category and a random slot every step. This is the "what would unguided parallel agents do?" comparison for AC-B1' / AC-B2.
+`scas/baselines.py` provides a **NullCoordinator** with the same interface as the real coordinator but `alpha = 0` for everyone, no group structure, no attractor updates. Each baseline agent picks a random category and a random slot every step. This is the "what would unguided parallel agents do?" comparison for AC-B1'.
+
+It also provides the **PartitionedNullCoordinator** (added in review) — the **official control** for AC-B2/AC-B3: the *same* fixed category→group partition as SCAS, attractors tracked, but the coupling switched off (`alpha ≡ 0`, proposer never steered). The random-category baseline conflates two effects (the hand-imposed partition and the control law); only the fair control isolates what the *law* adds. This distinction turned out to decide the verdicts in Part 4.
 
 ### 3.11 Coverage metric (AC-B2)
 
@@ -204,61 +208,62 @@ For the replay-mode check: take real-world hypothesis descriptions, label them w
 
 ## Part 4 — What was measured, and what came out
 
-The simulator was run end-to-end across five behavioral acceptance criteria (AC-B1' through AC-B5') and one embedding-quality check (T5.2). After three rounds of iteration on the AC specs and the simulator constants (see results-day3.md and results-day4.md for the full diary), the final results with committed defaults (`W_P=0`, `PSI_0=2.0`, mix-proposer, 330-string taxonomy):
+The simulator was run end-to-end across five behavioral acceptance criteria (AC-B1' through AC-B5') and one embedding-quality check (T5.2), then **hardened twice**: a review pass added the fair partition control and re-scored everything against it ([`results-review.md`](results-review.md)), and a second pass implemented the *genuine* integrated SCT dynamics, found and fixed a numerical bug in them, and confirmed the headline variant on fresh seeds ([`results-laws.md`](results-laws.md) §9). The corrected scoreboard:
 
-| AC | Threshold | Best observed | Verdict |
+| AC | Threshold | Observed | Verdict |
 | --- | --- | --- | --- |
 | **AC-B1'** — best-val_bpb parity | within 1 SE | SCAS 0.8974 vs baseline 0.8996 (Δ = −0.0022) | **PASS** |
-| **AC-B2** — coverage speedup | ratio ≥ 1.5 | **1.73 at T=0.1**, 1.69 at T=1.0, 1.54 at K'=10 | **PASS** at T ≤ 1.0 |
-| **AC-B3** — no mode collapse | inter/intra ≥ 1.5 | **2.52 at T=10**, 1.89 at T=0.1 | **PASS** across the entire T-sweep |
-| **AC-B4** — knob monotonicity | \|τ\| ≥ 0.7 | **τ = +1.00 aggregate**, +0.77 per-seed flat | **PASS** |
-| **AC-B5'** — safety envelope | 20/20 adversarial rejected | 20 passed in 0.20 s | **PASS** |
-| **T5.2** — embedding quality | silhouette > 0.05 | **0.029 over 30 real-style rows** | **FAIL (informative)** |
+| **AC-B2** — coverage speedup, *control-law marginal* | ≥ 1.5× vs **fair partition control** | committed defaults **1.39×**; best variant 1.94× on tuning seeds, **1.42× on fresh seeds** | **FAIL** — real advantage, threshold not robustly met |
+| **AC-B3** — no mode collapse, *control-law lift* | absolute ≥ 1.5 **and** lift ≥ 0.5 over fair control | absolute 2.09 ✓; committed lift **0.20** ✗ (control alone scores 1.89). Variant lift +2.3–2.4 only via a *scripted* anneal; the unscripted SCT law earns **+1.0–1.2 emergent** | **FAIL as committed; emergent-cohesion finding real but sub-variant** |
+| **AC-B4** — knob monotonicity | \|τ\| ≥ 0.7 | steady-state gate **τ = +1.00**; integrated dynamical law **τ = −0.40 (flat)** | **PASS for the algebraic gate only; FAIL for the real dynamics** |
+| **AC-B5'** — safety envelope | 20/20 adversarial rejected | 20/20 (now + 15 law/integrator unit tests) | **PASS** |
+| **T5.2** — embedding quality | silhouette > 0.05 | raw **0.029 FAIL** → `[CATEGORY]`-prefixed **0.130 PASS** | **FAIL raw / mitigation measured** (30-row fixture, partly circular) |
 
-### Headline reading
+### Headline reading (corrected)
 
-- **The SCAS coordination layer works in the synthetic regime.** Multi-consensus produces clean group separation; the mix-proposer + tuned constants give a real 1.5–1.7× coverage speedup over independent walkers; the coupling_T knob is monotonic.
-- **The Pareto frontier of "joint AC-B2 + AC-B3 pass" lives at `T ≤ 1.0`.** Tight T → fast coverage. Loose T → strong separation. They pull in opposite directions; T = 0.1 to 1.0 is the joint sweet spot.
-- **The safety envelope is bookkeeping but does its job.** No surprises.
-- **The embedding-quality finding is real and live-phase-relevant.** Synthetic descriptions carry explicit category prefixes (`change optimizer to …`, `tune architecture: …`) that MiniLM uses as anchors. Real `results.tsv`-style descriptions don't — and the architecture category specifically collapses to silhouette ≈ 0. This is the design's pre-flagged soft point and it came true.
+- **Most of the originally-reported effect was the hand-imposed partition, not the control law.** The headline 1.69× coverage speedup factors as 1.21× (partition, hand-assigned) × 1.39× (control law). The 1.89-of-2.09 group separation comes from three disjoint, prefix-anchored categories that exist whether or not the coupling is on. Scored against the fair control, both headline claims fail their bars with committed defaults.
+- **A tuned variant (embedding-space novelty search + exploit-gating + scripted anneal) passes both bars in-sample (1.94×, +2.32) — but the coverage pass does not survive fresh seeds (1.42×)**, its convergence is scripted rather than emergent, and its search requires pre-embedding the *entire finite candidate menu*, which a live LLM phase cannot do. Treat it as an upper bound on closed menus, not a transferable mechanism.
+- **The genuine SCT dynamics contribute exactly one thing: emergent cohesion.** After fixing an integrator bug (the original forward-Euler step was degenerate at T=1 and unstable below it — the first "dynamical law" results were artifacts), the integrated law produces a real, CI-solid +1.0–1.2 separation lift with *no scripting* — and *hurts* coverage (0.64×), because an exploit/explore redistribution cannot beat a novelty-seeking search at covering ground. Coverage is a search property; cohesion is what the law adds.
+- **The single-knob promise holds only for the steady-state gate.** `coupling_T` as a sigmoid temperature is perfectly monotonic (τ = +1.0). As a true relaxation timescale in the integrated law, it produces *no* separation response (flat across two decades); the law's tunable behavior lives in `psi_0`/`alpha_temp`, which trade coverage against cohesion along a Pareto frontier with **no joint-pass point**.
+- **The coordinator reshapes *where* the swarm searches, not *how good* the best result is.** best_val is flat within noise across every arm and every sweep, including performance-aware `w_p > 0`. Any research-efficiency claim needs a task where coverage breadth causes better optima — this closed synthetic landscape does not stress that link.
+- **The embedding-quality soft point came true, and the mitigation is now measured.** Raw real-style descriptions score 0.029 (architecture class ≈ 0 — MiniLM can't separate them without the synthetic prefix anchor). Prepending a `[CATEGORY]` tag lifts it to 0.130 — above threshold, but validated only on a 30-row hand-curated fixture and partly circular (the prefix injects the very partition the system is meant to exhibit).
 
 ### What this validates and what it doesn't
 
-**Validates** (in a small synthetic regime): the SCAS coordination layer produces diversity-with-selective-convergence behavior at the small-N scale. The single `coupling_T` knob is meaningful and monotonic. The safety envelope rejects all adversarial commits in the test set.
+**Validates**: the engineering (reproducible, seed-deterministic, laptop-scale, honest controls with bootstrap CIs), the safety envelope, embedding *feasibility* with a prefix anchor, and one genuine SCT behavior — unscripted emergent group cohesion from the integrated dynamics.
 
-**Does not validate**: that the result transfers to live LLM agents. That the committed constants generalize to a richer search space. That T5.2's recommended mitigation (a `[CATEGORY]` prompt prefix) actually works on real autoresearch descriptions.
+**Does not validate**: a coverage advantage attributable to the control law at the POC's own 1.5× bar (in-sample only); AC-B3 as a coordination claim (structural); the `coupling_T` knob for the real dynamics; transfer to live LLM agents, open hypothesis spaces, or richer search spaces. The negative results are findings, not failures of the harness — that was the POC's design.
 
 ---
 
-## Part 5 — Next steps to prove the idea
+## Part 5 — Next steps
 
-The POC's job was to falsify or validate the *coordination layer* design cheaply, offline. With validation in hand, the next steps move toward a live-agent Phase 2:
+The POC's job was to falsify or validate the *coordination layer* design cheaply, offline. The corrected outcome is **partial**: real emergent cohesion, no robust coverage win, knob valid only for the algebraic gate. The recommendation is therefore **not** a full live multi-agent build — it is a small set of narrowly-scoped experiments that resolve the open questions first. (Several items from the original next-steps list were executed during the hardening passes and are marked done.)
 
-### Immediate (~hours, no GPUs)
+### Done during hardening (no longer open)
 
-1. **Validate the embedding-quality mitigation.** Modify `program.md` so the agent prefixes its hypothesis description with a category tag (`[OPTIMIZER]`, `[ARCH]`, `[REG]`). Re-run T5.2 against a fresh 30-row sample. Pass silhouette > 0.05 ⇒ proceed; fail ⇒ try a richer embedder (sentence-T5 large, or one fine-tuned on research descriptions) before committing to the prefix approach.
+- ~~Validate the embedding-quality mitigation~~ — **measured**: `[CATEGORY]` prefix lifts silhouette 0.029 → 0.130 on the 30-row fixture (`results-review.md` §5). Still open: the same test on *real, non-curated* `results.tsv` rows.
+- ~~Stress the small-N / crowding assumption~~ — **swept**: at K'=10, AC-B2 recovers for G ≥ 4 (operating rule G ≳ K'/3, `results-review.md` §6e); AC-B3 absolute holds across the T-sweep.
+- ~~Implement the real `T·ψ̇ + ψ = u` dynamics~~ — **done, with an integrator bug found and fixed**; the law's contribution (emergent cohesion, no coverage win, no T-knob) is now characterized with CIs (`results-laws.md` §9).
 
-2. **Stress the small-N assumption.** Sweep K ∈ {3, 5, 8} in the simulator to confirm AC-B3 separation holds with more groups than categories (multi-consensus claim under crowding).
+### Immediate next (~hours, no GPUs) — must resolve before any live build
 
-### Short-term Phase 2 (~days, one GPU box)
+1. **Out-of-sample replication discipline.** Every remaining claim gets a fresh-seed confirmation (`--seed-offset`) before it is quoted — the headline variant's AC-B2 already failed this (1.94 → 1.42). Re-confirm the G ≳ K'/3 rule and the ψ₀ Pareto frontier on seeds ≥ 100.
+2. **An emergent-grouping AC-B3 test.** Drop the hand-assigned category partition and test whether the coupling alone forms and separates groups — the current AC-B3 is ~90% structural, so this is the experiment that would make separation an *SCT* claim rather than a partition artifact.
+3. **A benchmark where coverage causes quality.** The current landscape's best_val is insensitive to everything (flat within noise across all arms). Build a landscape where breadth demonstrably buys better optima (e.g. heavy-tailed minima depths, deceptive local basins) — otherwise "coverage speedup" has no efficiency payoff to point at.
+4. **Replay against real `results.tsv`** (when available) with and without the `[CATEGORY]` prefix, replacing the hand-curated fixture.
 
-3. **Build the coordinator as an HTTP service.** Extract `scas.coordinator.Coordinator` behind a small FastAPI surface: `POST /step` (agent reports a commit) returns `{alpha, target_card_text, avoid_list, accepted, reject_reason}`.
+### Then, if those hold: a minimal live Phase 2 (~days, one GPU box)
 
-4. **Wrap the autoresearch agent loop.** Modify the existing loop in `program.md` so each iteration:
-   - Calls the coordinator pre-step to get its prompt-augmentation packet.
-   - Runs the existing train.py loop.
-   - Calls the coordinator post-step to report (commit, val_bpb).
-   - Acts on the validator's accept/reject decision (revert if rejected).
+1. **Coordinator as a small HTTP service** (`POST /step` → `{alpha, target_card_text, avoid_list, accepted, reject_reason}`) wrapping `scas.coordinator` — carry the *SCT law arms* (attractor + similarity query), not the embedding-repulsion heuristic, whose farthest-point search needs a pre-embedded finite candidate menu that doesn't exist live.
+2. **Wrap the autoresearch loop** (`program.md`): pre-step prompt packet, post-step report, act on validator accept/reject. The key unknown this measures: an LLM's *effective* alpha — whether "refine toward X / explore away from Y" prompts steer a real agent the way `bernoulli(alpha)` steers the synthetic one.
+3. **Live K=3 paired run vs. independent baseline**, same wall-clock: best-val_bpb, category-coverage from the human-readable cards, validator-rejection rate. Sweep `w_p` jointly with the gate parameters rather than inheriting `w_p=0`.
 
-5. **Live K=3 paired run vs. K=3 independent baseline.** Same total wall-clock; measure best-val_bpb, coverage of "distinct hypothesis categories visited" (using the human-readable cards, not embeddings, as ground truth), and rate of validator rejections. The live-phase analog of AC-B1' / AC-B2 / AC-B3.
+### Medium-term (~weeks, multi-GPU or multi-host) — unchanged, contingent on the above
 
-### Medium-term (~weeks, multi-GPU or multi-host)
-
-6. **Scale to K=8–15 across multiple boxes.** This is where multi-consensus crowding (K' < K) becomes a real test. Validate AC-B3 holds under switching topologies (agents joining and leaving asynchronously).
-
-7. **Adversarial-agent harness.** Deliberately deploy one agent prompted to reward-hack. Verify the safety envelope quarantines it without contaminating the rest. This is the live-phase analog of AC-B5'.
-
-8. **Replace the keyword-heuristic category router** with a learned classifier (or LLM router) once enough live runs exist to label categories reliably.
+1. **Scale to K=8–15 across boxes** under switching topologies (agents joining/leaving).
+2. **Adversarial-agent harness** — one deliberately reward-hacking agent; verify the envelope quarantines it (live analog of AC-B5').
+3. **Replace the keyword category router** with a learned/LLM router once live runs exist to label.
 
 ### Out-of-scope but worth flagging
 
@@ -285,12 +290,16 @@ MIN_PLAUSIBLE_VAL_BPB = 0.5
 MAX_FAILURES_IN_LAST_5 = 2
 ```
 
-Reproduce in 36 seconds on a laptop:
+Reproduce on a laptop (each block a few minutes at most, embeddings cached):
 
 ```powershell
 uv sync
-uv run pytest scas/                                     # AC-B5' — 20 passed
-uv run python -m scas.sim --all-experiments             # AC-B1'/B2/B3/B4
-uv run python -m scas.replay                            # T5.2 silhouette
-uv run python -m scas.plot sim_runs/<latest_run_id>     # auto-detect plots
+uv run pytest scas/law_tests.py scas/validator_tests.py -q   # AC-B5' + law/integrator tests (35)
+uv run python -m scas.sim --all-experiments                  # AC-B1'/B2/B3/B4 + fair control
+uv run python -m scas.sim --compare-laws --paired-seeds 20 --agents-per-group 3
+                                                             # 6-arm law-vs-heuristic, bootstrap CIs
+uv run python -m scas.sim --paired-seeds 20 --seed-offset 100 --agents-per-group 3 --anneal
+                                                             # fresh-seed confirmation of the variant
+uv run python -m scas.replay                                 # T5.2 silhouette, raw + prefixed
+uv run python -m scas.plot sim_runs/<latest_run_id>          # auto-detect plots
 ```
