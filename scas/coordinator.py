@@ -168,3 +168,121 @@ class Coordinator:
         self.state.psi[card.agent_id] = psi
         self.state.alpha[card.agent_id] = compute_alpha(psi, self.coupling_T, self.psi_0)
         return improved
+
+
+class SCTCoordinator:
+    """Genuine synergetic dynamics — the dynamical-systems law the steady-state
+    ``Coordinator`` only approximates.
+
+    Two first-order relaxations are integrated explicitly (forward Euler, one
+    ``dt`` per observation), both sharing the single timescale ``coupling_T``:
+
+      * **Group attractor as a continuous order parameter.** Instead of snapping
+        the attractor to the best card's embedding, it relaxes toward the running
+        group-best ``z*_g``::
+
+            coupling_T * ċ_g = z*_g - c_g
+
+        renormalised to the unit sphere (MiniLM embeddings are unit-norm). The
+        consensus is a slow order parameter, not an instantaneous argmax.
+
+      * **Per-agent coupling order parameter ``psi``.** The synergetic relaxation
+        ``coupling_T * ψ̇ + ψ = u`` is actually integrated, so ``psi`` carries
+        memory of past mismatch instead of being recomputed from scratch::
+
+            u_i  = w_d * dist(z_i, c_g) + w_p * max(0, val_bpb_i - val_bpb_g_best)
+            ψ_i ← ψ_i + (dt / coupling_T) * (u_i - ψ_i)
+
+      ``alpha_i = sigmoid((psi_i - psi_0) / alpha_temp)`` in [0, 1] then gates the
+      proposer's exploit-vs-explore mix.
+
+    Small ``coupling_T`` ⇒ fast relaxation, ``psi`` tracks the instantaneous drive
+    (≈ the algebraic steady-state law). Large ``coupling_T`` ⇒ a sticky order
+    parameter that enslaves the agents gradually (Haken's enslaving principle).
+    That transient memory — and the relaxing consensus — is the dynamical content
+    the committed ``Coordinator`` omits by construction.
+
+    Contrast also with the engineered ``--embedding-repulsion``/``--anneal``
+    heuristic: this coordinator has **no** shared coverage memory, **no** exploit
+    cap, and **no** scripted convergence schedule. Any diversity-with-convergence
+    must emerge from the dynamics above.
+    """
+
+    coupling_T: float
+
+    def __init__(
+        self,
+        agents: list[str],
+        categories: list[str],
+        coupling_T: float = DEFAULT_COUPLING_T,
+        w_d: float = W_D,
+        w_p: float = W_P,
+        psi_0: float = PSI_0,
+        alpha_temp: float = 1.0,
+        dt: float = 1.0,
+    ):
+        if not agents or not categories:
+            raise ValueError("agents and categories must both be non-empty")
+        if coupling_T <= 0:
+            raise ValueError("coupling_T must be > 0 (it is a relaxation timescale)")
+        self.coupling_T = coupling_T
+        self.w_d = w_d
+        self.w_p = w_p
+        self.psi_0 = psi_0
+        self.alpha_temp = alpha_temp
+        self.dt = dt
+        self.agent_to_group: dict[str, int] = {
+            a: i % len(categories) for i, a in enumerate(agents)
+        }
+        self.group_to_category: dict[int, str] = dict(enumerate(categories))
+        self.state = CoordinatorState()
+        # Continuous group-best embedding the attractor order parameter chases.
+        self._best_emb: dict[int, np.ndarray] = {}
+        for g in range(len(categories)):
+            self.state.groups[g] = [
+                a for a, gg in self.agent_to_group.items() if gg == g
+            ]
+            self.state.group_best_val_bpb[g] = float("inf")
+
+    def observe(
+        self,
+        card: HypothesisCard,
+        val_bpb: float,
+        embedding: np.ndarray,
+        accepted: bool,
+    ) -> bool:
+        """Integrate one step of the attractor and psi relaxations for this agent.
+
+        Returns True if this observation improved the group best.
+        """
+        if not accepted:
+            return False
+        g = self.agent_to_group[card.agent_id]
+        improved = (
+            g not in self.state.attractors
+            or val_bpb < self.state.group_best_val_bpb[g]
+        )
+        if improved:
+            self.state.group_best_val_bpb[g] = float(val_bpb)
+            self._best_emb[g] = embedding.copy()
+
+        z_star = self._best_emb[g]
+        r = self.dt / self.coupling_T
+        if g not in self.state.attractors:
+            c = z_star.copy()
+        else:
+            c = self.state.attractors[g]
+            c = c + r * (z_star - c)
+            norm = float(np.linalg.norm(c))
+            if norm > 0:
+                c = c / norm
+        self.state.attractors[g] = c
+
+        u = compute_psi(
+            embedding, c, val_bpb, self.state.group_best_val_bpb[g], self.w_d, self.w_p
+        )
+        psi_prev = self.state.psi.get(card.agent_id)
+        psi = u if psi_prev is None else psi_prev + r * (u - psi_prev)
+        self.state.psi[card.agent_id] = psi
+        self.state.alpha[card.agent_id] = compute_alpha(psi, self.alpha_temp, self.psi_0)
+        return improved

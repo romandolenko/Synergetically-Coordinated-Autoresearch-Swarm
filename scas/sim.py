@@ -32,6 +32,7 @@ from scas.coordinator import (
     W_P,
     Coordinator,
     HypothesisCard,
+    SCTCoordinator,
     validate,
 )
 from scas.embedder import Embedder
@@ -44,7 +45,9 @@ from scas.synthetic import (
     propose,
 )
 
-CoordLike = Union[Coordinator, NullCoordinator, PartitionedNullCoordinator]
+CoordLike = Union[
+    Coordinator, SCTCoordinator, NullCoordinator, PartitionedNullCoordinator
+]
 
 
 def _make_run_id(seed: int, tag: str) -> str:
@@ -162,6 +165,9 @@ def _run_one(
     shared_coverage: bool = True,
     anneal: bool = False,
     anneal_start: float = 0.5,
+    sct: bool = False,
+    alpha_temp: float = 1.0,
+    sct_search: bool = False,
 ) -> Path:
     assert mode in ("scas", "baseline", "partition")
     rng = np.random.default_rng(seed)
@@ -181,8 +187,13 @@ def _run_one(
     )
     agent_ids = [f"a{i}" for i in range(n_agents)]
 
-    if mode == "scas":
-        coord: CoordLike = Coordinator(
+    if mode == "scas" and sct:
+        coord: CoordLike = SCTCoordinator(
+            agent_ids, categories, coupling_T=coupling_T, w_p=w_p, psi_0=psi_0,
+            alpha_temp=alpha_temp,
+        )
+    elif mode == "scas":
+        coord = Coordinator(
             agent_ids, categories, coupling_T=coupling_T, w_p=w_p, psi_0=psi_0
         )
     elif mode == "partition":
@@ -207,6 +218,16 @@ def _run_one(
     # buffer of covered embeddings for farthest-point exploration. Exploit is
     # gated to <=1 agent per group per step so group-mates stop co-clustering.
     use_emb_rep = embedding_repulsion and mode == "scas"
+    # The SCT law-driven arm also selects from the per-category candidate pool
+    # (exploit = nearest candidate to the relaxing attractor order parameter;
+    # explore = uniform global), but with no shared memory / gating / anneal.
+    use_sct = sct and mode == "scas"
+    # Hybrid (#3rd arm): the SCT law gating a farthest-point novelty search over a
+    # shared per-group coverage buffer, instead of global-uniform explore. Keeps
+    # the integrated-psi exploit schedule (uncapped) but drops the scripted anneal,
+    # isolating whether the law's emergent scheduling of a novelty search can match
+    # the heuristic's coverage while preserving emergent cohesion.
+    use_sct_search = use_sct and sct_search
     cand_strings: dict[str, list[str]] = {}
     cand_embs: dict[str, np.ndarray] = {}
     # Coverage buffers are keyed by group when shared (coordination: group-mates
@@ -215,7 +236,7 @@ def _run_one(
     # coordination — isolates search strategy from coordination).
     covered_buf: dict = {}
     covered_n: dict = {}
-    if use_emb_rep:
+    if use_emb_rep or use_sct:
         for g in range(n_groups):
             cat_g = coord.group_to_category[g]
             strings = [TEMPLATES[cat_g].format(slot=s) for s in TAXONOMY[cat_g]]
@@ -246,6 +267,9 @@ def _run_one(
                 "n_agents": n_agents,
                 "coverage_coupling": coverage_coupling,
                 "embedding_repulsion": embedding_repulsion,
+                "sct": sct,
+                "alpha_temp": alpha_temp,
+                "sct_search": sct_search,
             },
             indent=2,
         )
@@ -328,6 +352,29 @@ def _run_one(
                     emb = cand_embs[cat][idx]
                     covered_buf[ckey][covered_n[ckey]] = emb
                     covered_n[ckey] += 1
+                elif use_sct and g is not None:
+                    # SCT law-driven selection: the integrated alpha (memory of
+                    # past mismatch) sets the per-agent exploit probability; on
+                    # exploit, move to the candidate nearest the *relaxing*
+                    # attractor order parameter. Explore is global-uniform for the
+                    # pure law, or farthest-point over the shared group coverage
+                    # buffer for the hybrid (--sct-search). No exploit cap, no
+                    # anneal schedule — convergence/diversity is the dynamics'.
+                    attractor_emb = coord.state.attractors.get(g)
+                    a = alpha if alpha is not None else 0.0
+                    do_exploit = attractor_emb is not None and rng.random() < a
+                    if do_exploit:
+                        idx = int(np.argmax(cand_embs[cat] @ attractor_emb))
+                    elif use_sct_search:
+                        cov = covered_buf[g][: covered_n[g]]
+                        idx = _select_embedding(cand_embs[cat], cov, False, None, rng)
+                    else:
+                        idx = int(rng.integers(cand_embs[cat].shape[0]))
+                    summary = cand_strings[cat][idx]
+                    emb = cand_embs[cat][idx]
+                    if use_sct_search:
+                        covered_buf[g][covered_n[g]] = emb
+                        covered_n[g] += 1
                 else:
                     target = None
                     avoid = None
@@ -519,6 +566,10 @@ def _run_paired_at_T(
     embedder: Embedder,
     w_p: float = W_P,
     psi_0: float = PSI_0,
+    sct: bool = False,
+    alpha_temp: float = 1.0,
+    agents_per_group: int = 1,
+    sct_search: bool = False,
 ) -> tuple[dict, dict, Path]:
     """Run paired SCAS+baseline at a fixed T; return (scas_agg, baseline_agg, dir)."""
     sub = parent / f"T{coupling_T}"
@@ -528,10 +579,12 @@ def _run_paired_at_T(
     for seed in range(n_seeds):
         scas_dirs.append(
             _run_one(seed, "scas", K, K_prime, steps, coupling_T, sub, embedder,
-                     w_p=w_p, psi_0=psi_0)
+                     w_p=w_p, psi_0=psi_0, sct=sct, alpha_temp=alpha_temp,
+                     agents_per_group=agents_per_group, sct_search=sct_search)
         )
         baseline_dirs.append(
-            _run_one(seed, "baseline", K, K_prime, steps, coupling_T, sub, embedder)
+            _run_one(seed, "baseline", K, K_prime, steps, coupling_T, sub, embedder,
+                     agents_per_group=agents_per_group)
         )
     scas_agg = _aggregate(scas_dirs, sub / "paired_scas_summary.json", "scas")
     baseline_agg = _aggregate(
@@ -551,7 +604,8 @@ def _run_sweep_T(args: argparse.Namespace, T_values: list[float]) -> Path:
     for T in T_values:
         scas_agg, baseline_agg, sub = _run_paired_at_T(
             parent, n, args.K, args.K_prime, args.steps, T, embedder,
-            w_p=args.w_p, psi_0=args.psi_0,
+            w_p=args.w_p, psi_0=args.psi_0, sct=args.sct, alpha_temp=args.alpha_temp,
+            agents_per_group=args.agents_per_group, sct_search=args.sct_search,
         )
         s80_scas = scas_agg["mean_steps_to_80pct_coverage"]
         s80_base = baseline_agg["mean_steps_to_80pct_coverage"]
@@ -634,7 +688,8 @@ def _run_paired(args: argparse.Namespace) -> Path:
             _run_one(seed, "scas", args.K, args.K_prime, args.steps, args.coupling_T,
                      parent, embedder, w_p=args.w_p, psi_0=args.psi_0,
                      agents_per_group=apg, coverage_coupling=cc, embedding_repulsion=er,
-                     shared_coverage=shared, anneal=args.anneal, anneal_start=args.anneal_start)
+                     shared_coverage=shared, anneal=args.anneal, anneal_start=args.anneal_start,
+                     sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search)
         )
         baseline_dirs.append(
             _run_one(seed, "baseline", args.K, args.K_prime, args.steps, args.coupling_T,
@@ -693,6 +748,149 @@ def _run_paired(args: argparse.Namespace) -> Path:
     return parent
 
 
+def _bounded_steps80(row: dict) -> float:
+    v = row["steps_to_coverage"].get("0.8")
+    return float(v) if v is not None else float(row["agent_step_budget"])
+
+
+def _bootstrap(
+    fn, arrays: list[np.ndarray], n_boot: int = 5000, seed: int = 12345, ci: float = 0.95
+) -> tuple[float, float, float]:
+    """Paired seed-bootstrap CI for a statistic ``fn(*arrays)`` of per-seed arrays.
+
+    The same resampled seed indices are applied to every array, so paired
+    comparisons (same seeds across arms) keep their pairing.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(arrays[0])
+    point = float(fn(*arrays))
+    samples = np.empty(n_boot, dtype=float)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, n)
+        samples[b] = float(fn(*[a[idx] for a in arrays]))
+    lo = float(np.percentile(samples, (1.0 - ci) / 2.0 * 100.0))
+    hi = float(np.percentile(samples, (1.0 + ci) / 2.0 * 100.0))
+    return point, lo, hi
+
+
+def _compare_laws(args: argparse.Namespace) -> Path:
+    """Head-to-head: random baseline vs partition control vs SCT dynamical law
+    vs engineered heuristic, on identical seeds, with bootstrap CIs on the
+    headline ratios. Every arm shares the fixed partition + prefix templates +
+    embedding candidate pool; the only thing that differs is the coordination
+    mechanism, so the comparison isolates SCT-law vs hand-built heuristic.
+    """
+    n = args.paired_seeds if args.paired_seeds > 0 else 20
+    # Multi-agent groups are required for the heuristic's exploit-gating to mean
+    # anything; default to 3 so both laws are compared on the same footing.
+    apg = args.agents_per_group if args.agents_per_group > 1 else 3
+    parent = Path("sim_runs") / f"compare-laws-N{n}-{time.strftime('%Y%m%dT%H%M%S')}"
+    parent.mkdir(parents=True, exist_ok=True)
+    embedder = Embedder()
+
+    def _arm(name: str, mode: str, **kw) -> dict:
+        sub = parent / name
+        sub.mkdir(parents=True, exist_ok=True)
+        dirs = [
+            _run_one(seed, mode, args.K, args.K_prime, args.steps, args.coupling_T,
+                     sub, embedder, agents_per_group=apg, **kw)
+            for seed in range(n)
+        ]
+        agg_mode = mode if mode in ("baseline", "partition") else "scas"
+        return _aggregate(dirs, sub / "agg.json", agg_mode)
+
+    baseline = _arm("baseline", "baseline")
+    partition = _arm("partition", "partition")
+    sct = _arm("sct", "scas", sct=True, w_p=args.w_p, psi_0=args.psi_0,
+               alpha_temp=args.alpha_temp)
+    sct_search = _arm("sct_search", "scas", sct=True, sct_search=True, w_p=args.w_p,
+                      psi_0=args.psi_0, alpha_temp=args.alpha_temp)
+    heuristic = _arm("heuristic", "scas", embedding_repulsion=True, anneal=True,
+                     anneal_start=args.anneal_start, shared_coverage=True)
+
+    def steps80(agg: dict) -> np.ndarray:
+        return np.array([_bounded_steps80(r) for r in agg["per_seed"]])
+
+    def col(agg: dict, key: str) -> np.ndarray:
+        return np.array([float(r[key]) for r in agg["per_seed"]], dtype=float)
+
+    base_s, part_s = steps80(baseline), steps80(partition)
+    sct_s, hyb_s, heur_s = steps80(sct), steps80(sct_search), steps80(heuristic)
+    part_ioi = col(partition, "inter_over_intra")
+    sct_ioi, hyb_ioi, heur_ioi = (col(a, "inter_over_intra") for a in (sct, sct_search, heuristic))
+    base_b = col(baseline, "best_val_bpb")
+    sct_b, hyb_b, heur_b = (col(a, "best_val_bpb") for a in (sct, sct_search, heuristic))
+
+    ratio = lambda num, den: np.mean(num) / np.mean(den)   # noqa: E731
+    diff = lambda x, y: np.mean(x) - np.mean(y)            # noqa: E731
+
+    report: dict = {"compare_dir": str(parent), "n_seeds": n, "agents_per_group": apg,
+                    "K": args.K, "K_prime": args.K_prime, "coupling_T": args.coupling_T,
+                    "psi_0": args.psi_0, "alpha_temp": args.alpha_temp, "w_p": args.w_p,
+                    "arms": {}}
+    arm_data = (
+        ("sct", sct_s, sct_ioi, sct_b),
+        ("sct_search", hyb_s, hyb_ioi, hyb_b),
+        ("heuristic", heur_s, heur_ioi, heur_b),
+    )
+    for name, s, ioi, b in arm_data:
+        ac_b2_marg = _bootstrap(ratio, [part_s, s])
+        ac_b2_head = _bootstrap(ratio, [base_s, s])
+        ac_b3_abs = _bootstrap(lambda x: np.mean(x), [ioi])
+        ac_b3_lift = _bootstrap(diff, [ioi, part_ioi])
+        ac_b1_delta = _bootstrap(diff, [b, base_b])
+        report["arms"][name] = {
+            "mean_steps_to_80pct": float(np.mean(s)),
+            "ac_b2_marginal_vs_partition": {"point": ac_b2_marg[0], "ci95": [ac_b2_marg[1], ac_b2_marg[2]], "pass": ac_b2_marg[1] >= 1.5},
+            "ac_b2_headline_vs_baseline": {"point": ac_b2_head[0], "ci95": [ac_b2_head[1], ac_b2_head[2]]},
+            "ac_b3_inter_over_intra": {"point": ac_b3_abs[0], "ci95": [ac_b3_abs[1], ac_b3_abs[2]], "pass": ac_b3_abs[1] >= 1.5},
+            "ac_b3_lift_vs_partition": {"point": ac_b3_lift[0], "ci95": [ac_b3_lift[1], ac_b3_lift[2]], "pass": ac_b3_lift[1] >= 0.5},
+            "ac_b1_best_val_delta_vs_baseline": {"point": ac_b1_delta[0], "ci95": [ac_b1_delta[1], ac_b1_delta[2]]},
+        }
+    # Direct head-to-heads on coverage speed (>1 ⇒ second arm faster).
+    h2h = _bootstrap(ratio, [sct_s, heur_s])
+    hyb_vs_heur = _bootstrap(ratio, [hyb_s, heur_s])
+    report["sct_vs_heuristic_coverage_ratio"] = {"point": h2h[0], "ci95": [h2h[1], h2h[2]],
+                                                 "note": "mean(sct_steps)/mean(heur_steps); >1 ⇒ heuristic reaches 80% in fewer agent-steps"}
+    report["hybrid_vs_heuristic_coverage_ratio"] = {"point": hyb_vs_heur[0], "ci95": [hyb_vs_heur[1], hyb_vs_heur[2]],
+                                                    "note": "mean(sct_search_steps)/mean(heur_steps); >1 ⇒ heuristic faster, <1 ⇒ hybrid faster"}
+    report["controls"] = {
+        "baseline_mean_steps_to_80pct": float(np.mean(base_s)),
+        "partition_mean_steps_to_80pct": float(np.mean(part_s)),
+        "partition_inter_over_intra": float(np.mean(part_ioi)),
+        "baseline_mean_best_val_bpb": float(np.mean(base_b)),
+    }
+    (parent / "comparison.json").write_text(json.dumps(report, indent=2))
+
+    def _ci(d: dict) -> str:
+        return f"{d['point']:.2f} [{d['ci95'][0]:.2f}, {d['ci95'][1]:.2f}]"
+
+    print("\n=== Coordination-law comparison "
+          f"(N={n} seeds, G={args.K}, K'={args.K_prime}, M={apg}/group) ===")
+    print(f"{'arm':<10} {'steps_to80%':>11} {'AC-B2 marg vs part':>22} "
+          f"{'AC-B3 inter/intra':>20} {'AC-B3 lift':>18} {'best_val d':>14}")
+    print(f"{'baseline':<10} {np.mean(base_s):>11.1f} {'- (control)':>22} "
+          f"{'-':>20} {'-':>18} {'-':>14}")
+    print(f"{'partition':<10} {np.mean(part_s):>11.1f} {'1.00 (control)':>22} "
+          f"{np.mean(part_ioi):>20.2f} {'0.00 (control)':>18} {'-':>14}")
+    for name in ("sct", "sct_search", "heuristic"):
+        a = report["arms"][name]
+        print(f"{name:<10} {a['mean_steps_to_80pct']:>11.1f} "
+              f"{_ci(a['ac_b2_marginal_vs_partition']):>22} "
+              f"{_ci(a['ac_b3_inter_over_intra']):>20} "
+              f"{_ci(a['ac_b3_lift_vs_partition']):>18} "
+              f"{a['ac_b1_best_val_delta_vs_baseline']['point']:>+14.4f}")
+    print(f"\nsct=pure law (global explore); sct_search=law gating farthest-point "
+          f"search (no anneal); heuristic=search+gating+anneal.")
+    print(f"SCT-vs-heuristic coverage ratio:    {h2h[0]:.2f} [{h2h[1]:.2f}, {h2h[2]:.2f}] (>1 => heuristic faster)")
+    print(f"hybrid-vs-heuristic coverage ratio: {hyb_vs_heur[0]:.2f} "
+          f"[{hyb_vs_heur[1]:.2f}, {hyb_vs_heur[2]:.2f}] (<1 => hybrid faster)")
+    print("Pass bars: AC-B2 marginal CI-low >= 1.5; AC-B3 lift CI-low >= 0.5; "
+          "AC-B3 absolute CI-low >= 1.5.")
+    print(f"Full report: {parent / 'comparison.json'}")
+    return parent
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SCAS simulator")
     p.add_argument("--seed", type=int, default=0)
@@ -715,6 +913,11 @@ def _parse_args() -> argparse.Namespace:
     g.add_argument(
         "--all-experiments", action="store_true", dest="all_experiments",
         help="run paired-N10 (AC-B1'/B2/B3) and the default T-sweep (AC-B4) back-to-back",
+    )
+    g.add_argument(
+        "--compare-laws", action="store_true", dest="compare_laws",
+        help="head-to-head: random baseline vs partition control vs SCT dynamical "
+             "law vs engineered heuristic on the same seeds, with bootstrap CIs",
     )
     p.add_argument(
         "--paired-seeds", type=int, default=0, dest="paired_seeds",
@@ -762,11 +965,29 @@ def _parse_args() -> argparse.Namespace:
         "--anneal-start", type=float, default=0.5, dest="anneal_start",
         help="fraction of the run after which the converge phase begins (default 0.5)",
     )
+    p.add_argument(
+        "--sct", action="store_true", dest="sct",
+        help="use the SCTCoordinator dynamical law (integrated T·ψ̇+ψ=u + relaxing "
+             "attractor order parameter) with the law-driven embedding proposer",
+    )
+    p.add_argument(
+        "--alpha-temp", type=float, default=1.0, dest="alpha_temp",
+        help="sigmoid sharpness for alpha in the SCT law (separate from coupling_T, "
+             "which is the relaxation timescale; default 1.0)",
+    )
+    p.add_argument(
+        "--sct-search", action="store_true", dest="sct_search",
+        help="hybrid 3rd arm: the SCT law (--sct) gating a farthest-point novelty "
+             "search over shared group coverage instead of global-uniform explore "
+             "(no exploit cap, no anneal). Implies --sct.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    if args.sct_search:
+        args.sct = True  # the hybrid is the SCT law gating a novelty search
     if args.all_experiments:
         if args.paired_seeds <= 0:
             args.paired_seeds = 10
@@ -776,6 +997,9 @@ def main() -> None:
         args.sweep_T = "0.1,0.3,1.0,3.0,10.0"
         T_values = [float(s.strip()) for s in args.sweep_T.split(",")]
         _run_sweep_T(args, T_values)
+        return
+    if args.compare_laws:
+        _compare_laws(args)
         return
     if args.sweep_T:
         T_values = [float(s.strip()) for s in args.sweep_T.split(",")]
@@ -792,6 +1016,7 @@ def main() -> None:
         embedding_repulsion=args.embedding_repulsion or args.independent_repulsion or args.anneal,
         shared_coverage=not args.independent_repulsion,
         anneal=args.anneal, anneal_start=args.anneal_start,
+        sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search,
     )
     summary = json.loads((run_dir / "summary.json").read_text())
     print(json.dumps({"run_dir": str(run_dir), **summary}, indent=2))
