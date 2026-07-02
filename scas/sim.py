@@ -32,6 +32,7 @@ from scas.coordinator import (
     PSI_0,
     W_P,
     Coordinator,
+    EmergentSCTCoordinator,
     HypothesisCard,
     SCTCoordinator,
     validate,
@@ -47,7 +48,8 @@ from scas.synthetic import (
 )
 
 CoordLike = Union[
-    Coordinator, SCTCoordinator, NullCoordinator, PartitionedNullCoordinator
+    Coordinator, SCTCoordinator, EmergentSCTCoordinator,
+    NullCoordinator, PartitionedNullCoordinator,
 ]
 
 
@@ -164,6 +166,7 @@ def _run_one(
     sct: bool = False,
     alpha_temp: float = 1.0,
     sct_search: bool = False,
+    emergent_groups: bool = False,
 ) -> Path:
     assert mode in ("scas", "baseline", "partition")
     rng = np.random.default_rng(seed)
@@ -183,8 +186,13 @@ def _run_one(
     )
     agent_ids = [f"a{i}" for i in range(n_agents)]
 
-    if mode == "scas" and sct:
-        coord: CoordLike = SCTCoordinator(
+    if mode == "scas" and sct and emergent_groups:
+        coord: CoordLike = EmergentSCTCoordinator(
+            agent_ids, n_groups, coupling_T=coupling_T, w_p=w_p, psi_0=psi_0,
+            alpha_temp=alpha_temp,
+        )
+    elif mode == "scas" and sct:
+        coord = SCTCoordinator(
             agent_ids, categories, coupling_T=coupling_T, w_p=w_p, psi_0=psi_0,
             alpha_temp=alpha_temp,
         )
@@ -224,15 +232,39 @@ def _run_one(
     # isolating whether the law's emergent scheduling of a novelty search can match
     # the heuristic's coverage while preserving emergent cohesion.
     use_sct_search = use_sct and sct_search
+    # Emergent-grouping arm: no category->group binding exists, so the proposer
+    # draws from the *pooled* cross-category menu and the coordinator assigns
+    # groups dynamically (nearest attractor). Anything category-scoped here
+    # would smuggle the hand partition back in.
+    use_emergent = use_sct and emergent_groups
     cand_strings: dict[str, list[str]] = {}
     cand_embs: dict[str, np.ndarray] = {}
+    pool_strings: list[str] = []
+    pool_cats: list[str] = []
+    pool_embs: np.ndarray | None = None
     # Coverage buffers are keyed by group when shared (coordination: group-mates
     # divide the search + exploit-gating), or by agent when independent (the
     # "smart-walker" control that gets the same farthest-point search but no
     # coordination — isolates search strategy from coordination).
     covered_buf: dict = {}
     covered_n: dict = {}
-    if use_emb_rep or use_sct:
+    if use_emergent:
+        for cat_g in categories:
+            for s in TAXONOMY[cat_g]:
+                pool_strings.append(TEMPLATES[cat_g].format(slot=s))
+                pool_cats.append(cat_g)
+        pool_embs = np.stack(
+            [embedder.embed(s) for s in pool_strings]
+        ).astype(np.float32)
+        if use_sct_search:
+            # Keyed by *current* (dynamic) group; None catches pre-seed steps.
+            dim = pool_embs.shape[1]
+            covered_buf = {
+                g: np.zeros((steps * n_agents, dim), dtype=np.float32)
+                for g in [*range(n_groups), None]
+            }
+            covered_n = {g: 0 for g in [*range(n_groups), None]}
+    elif use_emb_rep or use_sct:
         for g in range(n_groups):
             cat_g = coord.group_to_category[g]
             strings = [TEMPLATES[cat_g].format(slot=s) for s in TAXONOMY[cat_g]]
@@ -266,6 +298,7 @@ def _run_one(
                 "sct": sct,
                 "alpha_temp": alpha_temp,
                 "sct_search": sct_search,
+                "emergent_groups": emergent_groups,
             },
             indent=2,
         )
@@ -301,14 +334,40 @@ def _run_one(
             # may pursue the attractor each step; the rest explore.
             group_exploit_count = {g: 0 for g in range(n_groups)}
             for agent_id in agent_ids:
-                g = coord.agent_to_group[agent_id]  # int (scas) or None (baseline)
-                if g is not None:
+                g = coord.agent_to_group[agent_id]  # int (scas) or None (baseline/pre-seed)
+                if use_emergent:
+                    cat = None  # decided by the selected pooled candidate below
+                elif g is not None:
                     cat = coord.group_to_category[g]
                 else:
                     cat = cat_keys[int(rng.integers(len(cat_keys)))]
                 alpha = coord.state.alpha.get(agent_id)
 
-                if use_emb_rep and g is not None:
+                if use_emergent:
+                    # Law-gated selection over the pooled menu. Exploit = nearest
+                    # candidate to the agent's *current* group attractor; explore
+                    # = uniform (pure law) or farthest-point over the current
+                    # group's shared coverage (hybrid). Before any group exists
+                    # (pre-seed), the agent simply explores.
+                    attractor_emb = (
+                        coord.state.attractors.get(g) if g is not None else None
+                    )
+                    a = alpha if alpha is not None else 0.0
+                    do_exploit = attractor_emb is not None and rng.random() < a
+                    if do_exploit:
+                        idx = int(np.argmax(pool_embs @ attractor_emb))
+                    elif use_sct_search:
+                        cov = covered_buf[g][: covered_n[g]]
+                        idx = _select_embedding(pool_embs, cov, False, None, rng)
+                    else:
+                        idx = int(rng.integers(pool_embs.shape[0]))
+                    summary = pool_strings[idx]
+                    emb = pool_embs[idx]
+                    cat = pool_cats[idx]
+                    if use_sct_search:
+                        covered_buf[g][covered_n[g]] = emb
+                        covered_n[g] += 1
+                elif use_emb_rep and g is not None:
                     ckey = g if shared_coverage else agent_id
                     cov = covered_buf[ckey][: covered_n[ckey]]
                     attractor_emb = (
@@ -420,6 +479,10 @@ def _run_one(
                 ok, reason = validate(commit)
                 if ok:
                     improved = coord.observe(card, val_bpb, emb, accepted=True)
+                    if use_emergent:
+                        # Membership is decided inside observe (seeding /
+                        # nearest-attractor); log the emergent label.
+                        g = coord.agent_to_group[agent_id]
                     if improved and g is not None:
                         attractor_text[g] = summary
                         at_f.write(
@@ -474,6 +537,23 @@ def _run_one(
         intra = None
         inter_over_intra = None
 
+    # Label-robust check for the emergent arm: silhouette of the final-window
+    # observations under the emergent labels. The inter/intra metric above uses
+    # final attractors with historical labels (identical machinery to the
+    # matched null, so the lift comparison is fair); silhouette instead scores
+    # only the settled tail, guarding against membership churn distorting it.
+    silhouette_final = None
+    if use_emergent:
+        tail = embeddings_log[-max(2, len(embeddings_log) // 4):]
+        labeled = [(gg, e) for gg, e in tail if gg is not None]
+        labels = [gg for gg, _ in labeled]
+        if len(set(labels)) >= 2 and len(labeled) > len(set(labels)):
+            from sklearn.metrics import silhouette_score
+
+            silhouette_final = float(
+                silhouette_score(np.stack([e for _, e in labeled]), labels)
+            )
+
     first_visit = _first_visit_steps(embeddings_log, landscape)
     distinct = sum(1 for v in first_visit if v is not None)
     steps_to_cov = _steps_to_coverage(first_visit, K_prime)
@@ -484,6 +564,8 @@ def _run_one(
         "inter_group_dist": inter,
         "intra_group_dist": intra,
         "inter_over_intra": inter_over_intra,
+        "emergent_groups": emergent_groups,
+        "silhouette_final_window": silhouette_final,
         "distinct_minima_visited": distinct,
         "first_visit_steps": [v for v in first_visit if v is not None],
         "steps_to_coverage": steps_to_cov,
@@ -524,6 +606,7 @@ def _aggregate(per_seed_dirs: list[Path], out_path: Path, mode: str) -> dict:
                 "inter_group_dist": r["inter_group_dist"],
                 "intra_group_dist": r["intra_group_dist"],
                 "inter_over_intra": r["inter_over_intra"],
+                "silhouette_final_window": r.get("silhouette_final_window"),
                 "steps_to_coverage": r["steps_to_coverage"],
                 "agent_step_budget": r["agent_step_budget"],
                 "K_prime": r["K_prime"],
@@ -548,6 +631,13 @@ def _aggregate(per_seed_dirs: list[Path], out_path: Path, mode: str) -> dict:
             if agg["mean_intra_group_dist"] > 0
             else None
         )
+        sils = [
+            r["silhouette_final_window"]
+            for r in rows
+            if r.get("silhouette_final_window") is not None
+        ]
+        if sils:
+            agg["mean_silhouette_final_window"] = float(np.mean(sils))
     out_path.write_text(json.dumps(agg, indent=2))
     return agg
 
@@ -687,7 +777,8 @@ def _run_paired(args: argparse.Namespace) -> Path:
                      parent, embedder, w_p=args.w_p, psi_0=args.psi_0,
                      agents_per_group=apg, coverage_coupling=cc, embedding_repulsion=er,
                      shared_coverage=shared, anneal=args.anneal, anneal_start=args.anneal_start,
-                     sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search)
+                     sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search,
+                     emergent_groups=args.emergent_groups)
         )
         baseline_dirs.append(
             _run_one(seed, "baseline", args.K, args.K_prime, args.steps, args.coupling_T,
@@ -1001,6 +1092,13 @@ def _parse_args() -> argparse.Namespace:
              "search over shared group coverage instead of global-uniform explore "
              "(no exploit cap, no anneal). Implies --sct.",
     )
+    p.add_argument(
+        "--emergent-groups", action="store_true", dest="emergent_groups",
+        help="drop the hand-assigned category partition: agents draw from the "
+             "pooled cross-category menu and group membership is emergent "
+             "(seed K slots, then nearest-attractor reassignment). Requires "
+             "--sct/--sct-search. Matched coupling-off null: add --psi-0 1e9.",
+    )
     args = p.parse_args()
     if args.sct_search:
         args.sct = True  # the hybrid is the SCT law gating a novelty search
@@ -1027,6 +1125,9 @@ def _parse_args() -> argparse.Namespace:
     if args.independent_repulsion and args.anneal:
         p.error("--anneal requires shared group coverage; "
                 "--independent-repulsion is the uncoordinated control")
+    if args.emergent_groups and not args.sct:
+        p.error("--emergent-groups requires --sct or --sct-search: emergent "
+                "membership is defined by the SCT attractor dynamics")
 
     # SCT-aware defaults: the committed psi_0=2.0 / alpha_temp=1.0 were tuned for
     # the string proposer; under the law-driven embedding proposer they squash
@@ -1070,6 +1171,7 @@ def main() -> None:
         shared_coverage=not args.independent_repulsion,
         anneal=args.anneal, anneal_start=args.anneal_start,
         sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search,
+        emergent_groups=args.emergent_groups,
     )
     summary = json.loads((run_dir / "summary.json").read_text())
     print(json.dumps({"run_dir": str(run_dir), **summary}, indent=2))

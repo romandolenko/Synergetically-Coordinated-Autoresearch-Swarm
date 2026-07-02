@@ -536,3 +536,110 @@ foreach ($p in 0.0,0.25,0.5,1.0,1.5,2.0) {
         --alpha-temp 0.3 --psi-0 $p --seed-offset 100
 }
 ```
+
+## 11. Emergent grouping (2026-07-02) — AC-B3 passes as an SCT claim, with no hand partition
+
+Every AC-B3 number so far was earned on a *scripted* partition: agents were
+hand-assigned to category-bound groups at construction, so ~90% of the
+separation was structural. This experiment removes the partition entirely and
+asks whether the coupling alone forms and separates groups.
+
+### 11a. Design
+
+- **`EmergentSCTCoordinator`** (`scas/coordinator.py`): group slots start
+  empty; the first G accepted observations seed them (attractor = that
+  embedding); every later accepted observation re-assigns its agent to the
+  nearest attractor (unit-norm embeddings, so nearest = argmax dot).
+  Membership churns as agents and attractors move. All relaxation dynamics are
+  inherited unchanged from `SCTCoordinator` (shared `_integrate`).
+- **Pooled menu** (`--emergent-groups`, requires `--sct`/`--sct-search`): the
+  proposer draws from the union of all categories' candidates — anything
+  category-scoped would smuggle the partition back in. Exploit = nearest pooled
+  candidate to the agent's current group attractor.
+- **The matched null**: the identical machinery with `--psi-0 1e9`, which pins
+  α at 0. This control matters because nearest-attractor bookkeeping is
+  k-means-like and "finds" separation even in uncoupled random walkers (it
+  scores inter/intra ≈ 1.5 and silhouette ≈ 0.3 below). The coupling must
+  show a *lift over that null*, not over zero.
+- Two metrics: the standard inter/intra (final attractors, historical labels —
+  identical machinery in both arms, so the lift is fair) and a label-robust
+  **final-window silhouette** (last 25% of accepted observations under the
+  emergent labels).
+- Two disjoint seed blocks from the start (0–19 and 100–119), per the §10
+  multi-block discipline. K=3 slots, K'=5, M=3, T=1.0, psi_0=0.5 (coupled
+  arms), alpha_temp=0.3, 200 steps.
+
+### 11b. Results (N=20 per block, bootstrap CIs)
+
+| Arm | inter/intra | silhouette (final window) | **ioi lift vs null** | sil lift vs null |
+| --- | --- | --- | --- | --- |
+| *block 0–19* | | | | |
+| null (α=0) | 1.51 [1.32, 1.69] | 0.313 | — | — |
+| hand partition (same seeds, reference) | 1.90 | — | — | — |
+| **pure SCT law** | 2.40 [2.14, 2.64] | 0.404 | **+0.89 [+0.73, +1.03]** ✓ | +0.091 [+0.035, +0.138] |
+| **SCT + search (hybrid)** | 3.00 [2.91, 3.08] | 0.602 | **+1.49 [+1.30, +1.70]** ✓ | +0.289 [+0.224, +0.355] |
+| *block 100–119* | | | | |
+| null (α=0) | 1.58 [1.47, 1.70] | 0.344 | — | — |
+| hand partition (same seeds, reference) | 1.89 | — | — | — |
+| **pure SCT law** | 2.55 [2.38, 2.73] | 0.431 | **+0.97 [+0.84, +1.08]** ✓ | +0.087 [+0.046, +0.124] |
+| **SCT + search (hybrid)** | 2.96 [2.88, 3.05] | 0.599 | **+1.38 [+1.25, +1.51]** ✓ | +0.254 [+0.206, +0.302] |
+
+Supporting observables (final window / full run):
+
+| Arm | modal-category purity | membership churn per accepted obs |
+| --- | --- | --- |
+| null | 0.87 / 0.91 | 0.59 |
+| pure SCT law | 0.92 / 0.91 | 0.34 |
+| hybrid | **1.000 / 1.000** | 0.39 |
+
+### 11c. Findings
+
+1. **The coupling alone forms and separates groups — AC-B3 passes as an SCT
+   claim.** Both coupled arms clear both AC-B3 bars *by CI-low, in both seed
+   blocks*: absolute inter/intra ≥ 1.5 (pure 2.40/2.55, hybrid ~3.0) and lift
+   ≥ 0.5 over the fair (matched-null) control (pure +0.89/+0.97, hybrid
+   +1.49/+1.38). This is the first CI-solid joint AC-B3 pass in the project
+   that is not attributable to a scripted partition — and it replicates across
+   blocks, consistent with the running pattern that cohesion effects replicate
+   tightly.
+2. **Emergent separation *exceeds* the hand partition.** On the same seeds the
+   scripted partition control scores inter/intra 1.90/1.89; the emergent pure
+   law reaches 2.40–2.55 and the hybrid ~3.0. Letting the dynamics choose the
+   groups beats assigning them.
+3. **What the groups converge to is the latent category structure.** The
+   hybrid's emergent groups end with *perfect* modal-category purity (1.000 in
+   both blocks; pure law 0.91–0.92; null 0.87–0.91), and the coupling roughly
+   halves membership churn (0.34–0.39 vs 0.59). The honest phrasing: the
+   coupling does not create structure ex nihilo — it *finds, locks onto, and
+   amplifies* the cluster structure already latent in the prefix-anchored
+   embedding space, which uncoupled bookkeeping only weakly tracks.
+4. **The coverage cost is real and worse than the partitioned setting.**
+   Against the same-seed baseline, the emergent coupled arms are *slower* to
+   cover (pure 0.82/0.52, hybrid 0.73/0.74 speedup ratio; the null covers at
+   1.31/1.02). With a pooled menu and no partition, exploit episodes revisit
+   attractor neighbourhoods across the whole space — §9b's "the law hurts
+   coverage" transfers unchanged. The emergent result is a cohesion win, not a
+   coverage win.
+5. Committed defaults are untouched (regression on this code: 44.8 / 1.39 /
+   2.0948 exactly; 39 unit tests pass, 4 new for emergent membership).
+
+The live-phase implication is direct: the SCT law arm carried into Phase 2 no
+longer *requires* a hand-built category router to exhibit separation — the
+attractor dynamics can grow the partition. Whether MiniLM finds comparable
+latent structure in real, non-templated hypothesis cards is exactly the T5.2
+embedding-quality question (silhouette 0.029 raw), so §11 raises that check's
+priority rather than retiring it.
+
+Run dirs: `paired-N20-20260702T090322/-090403/-092422` (block 0: pure /
+hybrid / null), `paired-N20-20260702T092519/-092611/-092722` (block 100);
+regression `paired-N10-20260702T090313`; aggregate with CIs in
+`sim_runs/emergent_grouping_20260702.json`. Repro:
+
+```powershell
+# coupled arms + matched null, two disjoint seed blocks
+foreach ($off in 0,100) {
+    uv run python -m scas.sim --paired-seeds 20 --sct --emergent-groups --agents-per-group 3 --seed-offset $off
+    uv run python -m scas.sim --paired-seeds 20 --sct-search --emergent-groups --agents-per-group 3 --seed-offset $off
+    uv run python -m scas.sim --paired-seeds 20 --sct --emergent-groups --agents-per-group 3 --psi-0 1e9 --seed-offset $off
+}
+```

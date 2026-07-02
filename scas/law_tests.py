@@ -9,7 +9,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from scas.coordinator import HypothesisCard, SCTCoordinator, compute_alpha, compute_psi
+from scas.coordinator import (
+    EmergentSCTCoordinator,
+    HypothesisCard,
+    SCTCoordinator,
+    compute_alpha,
+    compute_psi,
+)
 from scas.sim import _first_visit_steps, _select_embedding, _steps_to_coverage
 from scas.synthetic import Landscape
 
@@ -102,6 +108,61 @@ def test_sct_attractor_relaxes_toward_new_best(T):
     if T >= 10.0:
         assert sims[0] < 0.9, "large T should move gradually"
     assert sims[-1] > 0.99  # eventually enslaved by the new best
+
+
+# ------------------------------------------------- emergent group membership
+
+
+def test_emergent_seeds_all_slots_before_assigning_nearest():
+    coord = EmergentSCTCoordinator(["a0", "a1"], n_groups=2, coupling_T=1.0,
+                                   psi_0=0.5, alpha_temp=0.3)
+    assert coord.agent_to_group == {"a0": None, "a1": None}
+    e0 = _unit([1, 0, 0])
+    e1 = _unit([0, 1, 0])
+    coord.observe(_card("a0", 0), 1.0, e0, accepted=True)
+    coord.observe(_card("a1", 0), 1.1, e1, accepted=True)
+    # each accepted observation claimed one empty slot
+    assert coord.agent_to_group["a0"] != coord.agent_to_group["a1"]
+    assert set(coord.state.attractors.keys()) == {0, 1}
+    assert float(coord.state.attractors[0] @ e0) == pytest.approx(1.0, abs=1e-5)
+    assert float(coord.state.attractors[1] @ e1) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_emergent_reassigns_agent_to_nearest_attractor():
+    coord = EmergentSCTCoordinator(["a0", "a1", "a2"], n_groups=2, coupling_T=1.0,
+                                   psi_0=0.5, alpha_temp=0.3)
+    e0 = _unit([1, 0, 0])
+    e1 = _unit([0, 1, 0])
+    coord.observe(_card("a0", 0), 1.0, e0, accepted=True)   # seeds slot 0
+    coord.observe(_card("a1", 0), 1.0, e1, accepted=True)   # seeds slot 1
+    # a2 lands near e1 -> joins slot 1
+    coord.observe(_card("a2", 0), 2.0, _unit([0.1, 1, 0]), accepted=True)
+    assert coord.agent_to_group["a2"] == 1
+    assert coord.state.groups[1] == ["a1", "a2"]
+    # a2 then moves near e0 -> churns to slot 0; membership lists stay a partition
+    coord.observe(_card("a2", 1), 2.0, _unit([1, 0.1, 0]), accepted=True)
+    assert coord.agent_to_group["a2"] == 0
+    assert coord.state.groups[0] == ["a0", "a2"]
+    assert coord.state.groups[1] == ["a1"]
+    all_members = coord.state.groups[0] + coord.state.groups[1]
+    assert sorted(all_members) == ["a0", "a1", "a2"]
+
+
+def test_emergent_rejected_observation_changes_nothing():
+    coord = EmergentSCTCoordinator(["a0"], n_groups=2, coupling_T=1.0)
+    coord.observe(_card("a0", 0), 1.0, _unit([1, 0, 0]), accepted=False)
+    assert coord.agent_to_group["a0"] is None
+    assert coord.state.attractors == {}
+
+
+def test_emergent_null_psi0_huge_pins_alpha_at_zero():
+    """The matched coupling-off null (--psi-0 1e9): same machinery, alpha == 0."""
+    coord = EmergentSCTCoordinator(["a0", "a1"], n_groups=2, coupling_T=1.0,
+                                   psi_0=1e9, alpha_temp=0.3)
+    coord.observe(_card("a0", 0), 1.0, _unit([1, 0, 0]), accepted=True)
+    coord.observe(_card("a1", 0), 1.0, _unit([0, 1, 0]), accepted=True)
+    coord.observe(_card("a0", 1), 2.0, _unit([0, 0, 1]), accepted=True)
+    assert all(a == pytest.approx(0.0) for a in coord.state.alpha.values())
 
 
 # ------------------------------------------------------------ selection logic

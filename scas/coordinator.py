@@ -266,6 +266,12 @@ class SCTCoordinator:
         if not accepted:
             return False
         g = self.agent_to_group[card.agent_id]
+        return self._integrate(card.agent_id, g, val_bpb, embedding)
+
+    def _integrate(
+        self, agent_id: str, g: int, val_bpb: float, embedding: np.ndarray
+    ) -> bool:
+        """The shared relaxation dynamics, given a group assignment ``g``."""
         improved = (
             g not in self.state.attractors
             or val_bpb < self.state.group_best_val_bpb[g]
@@ -289,8 +295,87 @@ class SCTCoordinator:
         u = compute_psi(
             embedding, c, val_bpb, self.state.group_best_val_bpb[g], self.w_d, self.w_p
         )
-        psi_prev = self.state.psi.get(card.agent_id)
+        psi_prev = self.state.psi.get(agent_id)
         psi = u if psi_prev is None else u + (psi_prev - u) * decay
-        self.state.psi[card.agent_id] = psi
-        self.state.alpha[card.agent_id] = compute_alpha(psi, self.alpha_temp, self.psi_0)
+        self.state.psi[agent_id] = psi
+        self.state.alpha[agent_id] = compute_alpha(psi, self.alpha_temp, self.psi_0)
         return improved
+
+
+class EmergentSCTCoordinator(SCTCoordinator):
+    """SCT dynamics with *emergent* group membership — no hand-assigned partition.
+
+    The committed coordinators bind each group to a taxonomy category at
+    construction, so AC-B3 separation is largely structural (the partition is
+    scripted, not formed). Here group slots start empty and membership is a
+    product of the dynamics:
+
+      * **Seeding**: the first ``n_groups`` accepted observations each claim an
+        empty slot (attractor = that embedding).
+      * **Assignment**: every later accepted observation re-assigns its agent to
+        the slot whose attractor is nearest in embedding space (unit-norm
+        embeddings, so nearest = argmax dot). Membership can churn as agents and
+        attractors move — that churn *is* the self-organisation under test.
+
+    All relaxation dynamics (attractor order parameter, integrated psi, alpha
+    gate) are inherited unchanged from ``SCTCoordinator``. ``group_to_category``
+    is empty by construction: the proposer must draw from the pooled cross-
+    category menu, otherwise the partition would be smuggled back in.
+
+    The matched null for this arm is the same class with ``psi_0`` set huge
+    (alpha pins at 0, agents never exploit): identical seeding, assignment, and
+    bookkeeping over *uncoupled* walkers, so any separation the coupling forms
+    must show up as a lift over that null, not over zero.
+    """
+
+    def __init__(
+        self,
+        agents: list[str],
+        n_groups: int,
+        coupling_T: float = DEFAULT_COUPLING_T,
+        w_d: float = W_D,
+        w_p: float = W_P,
+        psi_0: float = PSI_0,
+        alpha_temp: float = 1.0,
+        dt: float = 1.0,
+    ):
+        if n_groups < 1:
+            raise ValueError("n_groups must be >= 1")
+        super().__init__(
+            agents, [f"slot{g}" for g in range(n_groups)], coupling_T=coupling_T,
+            w_d=w_d, w_p=w_p, psi_0=psi_0, alpha_temp=alpha_temp, dt=dt,
+        )
+        self.n_groups = n_groups
+        # Undo the parent's hand partition: nobody belongs anywhere yet, and no
+        # group is bound to a category.
+        self.agent_to_group = {a: None for a in agents}
+        self.group_to_category = {}
+        self.state.groups = {g: [] for g in range(n_groups)}
+
+    def observe(
+        self,
+        card: HypothesisCard,
+        val_bpb: float,
+        embedding: np.ndarray,
+        accepted: bool,
+    ) -> bool:
+        if not accepted:
+            return False
+        aid = card.agent_id
+        # Slots are seeded in _best_emb order; once all are live, join nearest.
+        empty = [g for g in range(self.n_groups) if g not in self._best_emb]
+        if empty:
+            g = empty[0]
+        else:
+            sims = [
+                float(embedding @ self.state.attractors[g])
+                for g in range(self.n_groups)
+            ]
+            g = int(np.argmax(sims))
+        prev = self.agent_to_group.get(aid)
+        if prev != g:
+            if prev is not None:
+                self.state.groups[prev].remove(aid)
+            self.state.groups[g].append(aid)
+            self.agent_to_group[aid] = g
+        return self._integrate(aid, g, val_bpb, embedding)
