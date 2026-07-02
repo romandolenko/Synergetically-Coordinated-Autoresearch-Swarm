@@ -226,7 +226,10 @@ beats it; the law's value is in not having to script, not in winning the metrics
 from −0.003 at high-exploit to +0.002 at high-explore — i.e. over-exploring slightly
 hurts best-found, but all within noise. The coordinator remains performance-blind.)
 
-Sweep data: `sim_runs/hybrid_psi0_sweep.json`.
+Sweep data: `sim_runs/hybrid_psi0_sweep.json`. (Fresh-seed + post-fix rerun of
+this sweep: §10 — the frontier shape and the lifts replicate exactly; the
+coverage marginals do not, and the "balanced operating point" claim is revised
+down there.)
 
 ## 7. Turning the objective on (`w_p` sweep) — performance-awareness doesn't help the objective
 
@@ -474,3 +477,62 @@ uv run python -m scas.sim --paired-seeds 10
 
 Run dirs: `compare-laws-N20-20260609T183942`, `sweep-T5-N10-20260609T183943`,
 `paired-N20-20260609T183944`, `paired-N10-20260609T183705` (regression check).
+
+## 10. Fresh-seed ψ₀ frontier (2026-07-02) — the tradeoff replicates exactly; the hybrid's coverage does not
+
+The §6 sweep had two liabilities: it predated the §9 integrator fix (its
+"hybrid" was effectively the steady-state gate) and, like everything before
+§9d, it ran on the tuning seeds. The full sweep was rerun with the fixed
+integrator on never-touched seeds 100–119 (hybrid `--sct-search`, N=20, M=3,
+K'=5, alpha_temp=0.3; partition control at 56.5 steps / inter-intra 1.89 on
+this seed block; bootstrap CIs, 10k resamples):
+
+| psi_0 | hybrid steps→80% | AC-B2 marginal (§6 in-sample) | **AC-B2 marginal (fresh)** | AC-B3 lift (§6) | **AC-B3 lift (fresh)** |
+| --- | --- | --- | --- | --- | --- |
+| 0.0 | 110.8 | 0.75 | **0.51 [0.38, 0.73]** | +2.59 | **+2.74 [2.51, 2.95]** |
+| 0.25 | 79.6 | 1.16 | **0.71 [0.53, 0.98]** | +1.73 | **+1.86 [1.78, 1.93]** |
+| 0.5 | 58.9 | 1.23 | **0.96 [0.67, 1.38]** | +1.20 | **+1.22 [1.14, 1.30]** |
+| 1.0 | 46.5 | 1.56 | **1.21 [0.84, 1.78]** | +0.46 | **+0.47 [0.39, 0.55]** |
+| 1.5 | 39.3 | 1.60 | **1.44 [0.96, 2.09]** | +0.15 | **+0.21 [0.13, 0.29]** |
+| 2.0 | 38.3 | 1.52 | **1.47 [0.98, 2.15]** | +0.05 | **+0.12 [0.05, 0.19]** |
+
+**Finding 1 — the frontier itself replicates, remarkably cleanly.** The marginal
+is strictly monotone increasing in `psi_0` and the lift strictly monotone
+decreasing, exactly as in-sample; the cohesion lifts land within ~0.1 of the §6
+values at every point, with tight CIs. The §6 structural claim — a single
+homeostatic knob cannot buy coverage and cohesion at once — is confirmed
+out-of-sample and post-fix.
+
+**Finding 2 — the coverage half of the frontier shifts down wholesale.** Every
+fresh marginal is 0.1–0.4 below its in-sample twin. **No `psi_0` clears 1.5**
+(the closest, `psi_0=2.0`, gives 1.47 [0.98, 2.15] with zero cohesion), so the
+"no joint pass" conclusion strengthens: on fresh seeds there is not even a solo
+AC-B2 pass anywhere on the frontier. This is the same direction and roughly the
+same magnitude as the heuristic's §9d drop (1.94 → 1.42) — seed-block variance
+in coverage marginals, again larger than within-block CIs suggest (the fresh
+partition control is itself faster, 56.5 vs 65.0 steps).
+
+**Finding 3 — the §6 "honest ceiling" is revised down.** At the previously
+recommended balanced operating point (`psi_0 ≈ 0.25–0.5`) the fresh marginals
+are **0.71–0.96 — at or below partition parity**. The balanced hybrid no longer
+demonstrates any coverage advantage over the fair control; what survives at that
+operating point is the emergent cohesion (+1.2 to +1.9, unscripted, tightly
+replicated). The corrected claim for the unscripted law: *it buys tunable,
+genuinely emergent cohesion at zero-to-negative coverage cost relative to a
+partitioned control — the coverage side of the §6 sales pitch is withdrawn.*
+
+Consistency note: this fresh-seed table is compatible with §9b's in-sample
+post-fix hybrid (marginal 1.36 [0.87, 2.33] at `psi_0=0.5` there vs 0.96
+[0.67, 1.38] here) — both CIs straddle 1, and the point difference is the same
+seed-block effect as above, not a contradiction.
+
+Run dirs: `paired-N20-20260702T075527/-075615/-075709/-075805/-075905/-080006`
+(psi_0 = 0 / 0.25 / 0.5 / 1.0 / 1.5 / 2.0); aggregate with CIs in
+`sim_runs/fresh_seed_confirmation_20260702.json`. Repro:
+
+```powershell
+foreach ($p in 0.0,0.25,0.5,1.0,1.5,2.0) {
+    uv run python -m scas.sim --sct-search --paired-seeds 20 --agents-per-group 3 `
+        --alpha-temp 0.3 --psi-0 $p --seed-offset 100
+}
+```

@@ -286,6 +286,8 @@ of distinct optima and the coordination law delivers diversity-with-selective-
 convergence. This removes the last scope caveat from §6c–§6d.
 
 Run dirs: `paired-N10-20260528T203032` (G=6 N=10) plus the G=4/5 and G=6-N=20 sweep.
+(Fresh-seed confirmation of this table: §6g — the G ≥ 4 passes replicate, the
+G=3 failure does not.)
 
 ## 6f. Fresh-seed confirmation (2026-06-09) — §6c/§6d's "robust" AC-B2 pass does not replicate
 
@@ -301,6 +303,38 @@ re-measured at N=20 inside `--compare-laws` is **1.03× [0.74, 1.40] — a wash,
 not a harm** (the decomposition conclusion stands: coordination, not search,
 carries the speedup); (b) the SCT integrator bug and its consequences are in
 [`results-laws.md`](results-laws.md) §9. Run dir: `paired-N20-20260609T183944`.
+
+## 6g. Fresh-seed confirmation of the §6e G-sweep (2026-07-02) — the pass region replicates, the G=3 failure boundary does not
+
+The remaining fresh-seed debt from §6f was the G ≳ K'/3 operating rule itself.
+All four group counts were rerun at K'=10 (M=3, anneal, N=20) on never-touched
+seeds 100–119, with bootstrap CIs (10k resamples):
+
+| Groups G | crowding K'/G | AC-B2 marginal (in-sample) | **AC-B2 marginal (fresh)** | **AC-B3 lift (fresh)** |
+| --- | --- | --- | --- | --- |
+| 3 | 3.3 | 1.30 ✗ | **1.73 [1.29, 2.25]** ✓ | +2.36 [2.27, 2.45] ✓ |
+| 4 | 2.5 | 1.65 ✓ | **1.85 [1.47, 2.29]** ✓ | +2.55 [2.46, 2.63] ✓ |
+| 5 | 2.0 | 1.87 ✓ | **2.04 [1.57, 2.60]** ✓ | +2.48 [2.43, 2.55] ✓ |
+| 6 | 1.67 | 1.61 ✓ | **2.07 [1.56, 2.84]** ✓ | +2.43 [2.38, 2.49] ✓ |
+
+**Finding 1 — the pass region replicates, and strengthens.** G=4–6 all clear the
+1.5 bar on fresh seeds by point estimate, and G=5/G=6 clear it even at CI-low.
+AC-B3 lifts replicate essentially exactly (within ±0.1 of in-sample — expected,
+the anneal scripts them).
+
+**Finding 2 — the §6e failure boundary was seed noise.** G=3 at K'=10, the one
+failing config that motivated the whole "crowding" story (1.30 in-sample), scores
+**1.73 [1.29, 2.25] on fresh seeds** — a pass. Together with §6f (where the same
+seed block moved the K'=5 headline the *other* way, 1.94 → 1.42), the honest
+reading is that coverage marginals carry substantial *seed-block* variance that
+20-seed within-block CIs understate. The G ≳ K'/3 rule survives only as
+conservative guidance: the passing region (G ≥ 4 at K'=10) is confirmed
+out-of-sample, but the sharp claim "G=3 fails under crowding" is withdrawn — the
+boundary's location is not stable across seed blocks. Cohesion lifts, by
+contrast, replicate tightly in every configuration measured so far.
+
+Run dirs: `paired-N20-20260702T074909/-074957/-075202/-075336` (G=3/4/5/6);
+aggregate with CIs in `sim_runs/fresh_seed_confirmation_20260702.json`.
 
 ## 7. Reproducibility
 
@@ -333,6 +367,12 @@ uv run python -m scas.sim --paired-seeds 10 --agents-per-group 3 --anneal --K-pr
 # §6e — relieve K'=10 crowding with more groups (needs the 6-category taxonomy)
 uv run python -m scas.sim --paired-seeds 20 --K 6 --agents-per-group 3 --anneal --K-prime 10
 uv run python -m scas.sim --paired-seeds 10 --K 4 --agents-per-group 3 --anneal --K-prime 10
+
+# §6g — fresh-seed confirmation of the G-sweep (seeds 100-119)
+foreach ($g in 3,4,5,6) {
+    uv run python -m scas.sim --paired-seeds 20 --K $g --agents-per-group 3 --anneal `
+        --K-prime 10 --seed-offset 100
+}
 ```
 
 Run dirs: `paired-N10-20260528T190733` (W_P=0), `…190742` (W_P=5),
