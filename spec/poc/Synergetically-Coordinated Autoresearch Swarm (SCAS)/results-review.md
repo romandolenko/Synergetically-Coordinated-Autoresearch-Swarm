@@ -94,6 +94,10 @@ than inherit `W_P=0`.
 
 ## 5. Embedding mitigation — the `[CATEGORY]` prefix works on the replay fixture
 
+> **Extended by §8 (2026-07-03):** on a realistic non-curated 60-row sample the
+> raw score drops to 0.022, the prefixed score to 0.089 (still passing), and
+> ~43% of regularization-intent rows turn out to be router mislabels.
+
 Replay over the 30-row fixture, raw vs `[CATEGORY]`-prefixed embedding, same rows:
 
 | Metric | Raw | Prefixed |
@@ -377,3 +381,63 @@ foreach ($g in 3,4,5,6) {
 
 Run dirs: `paired-N10-20260528T190733` (W_P=0), `…190742` (W_P=5),
 `…190751` (W_P=50), `replay-20260528T190812`.
+
+## 8. Replay on a realistic (LLM-generated) `results.tsv` sample (2026-07-03) — raw fails harder, the prefix margin halves, and the router becomes a co-failure
+
+Real `results.tsv` rows still don't exist (no live autoresearch run has been
+executed), so the open half of §5's caveat (a) can't be closed yet. What *can*
+be tightened is the curation half: the 30-row fixture is short, clean,
+one-clause-per-row text that no actual agent writes. This section replays a
+**60-row LLM-generated sample written to mimic what the `program.md` loop
+would actually log** — verbose multi-clause commit messages, cross-category
+changes ("lower the peak to 3e-4 and add dropout 0.05 together"), reverts,
+variance-check reruns, OOM notes, follow-ups referencing earlier steps.
+Deliberately non-curated for separability; three crash rows. The sample is
+committed at `scas/fixtures/realistic_results.tsv` so the numbers are
+reproducible. It is *generated realism*, not ground truth — it bounds the
+answer from the friendly side (an LLM writing plausible descriptions), and
+true run data can only be messier.
+
+### 8a. Results (same replay pipeline as §5, raw vs `[CATEGORY]`-prefixed)
+
+| Metric | Fixture (§5, 30 rows) | Realistic sample (60 rows) |
+| --- | --- | --- |
+| Raw silhouette (≥ 0.05 passes) | 0.029 FAIL | **0.022 FAIL** |
+| — optimizer class | 0.059 | **−0.006** |
+| — architecture class | 0.0001 | 0.019 |
+| — regularization class | 0.057 | 0.078 |
+| Prefixed silhouette | **0.130 PASS** | **0.089 PASS** |
+| Prefix lift | +0.10 | **+0.068** |
+
+### 8b. Findings
+
+1. **Raw embeddings degrade further on realistic text** (0.029 → 0.022, with
+   the optimizer class going *negative*): long multi-clause descriptions
+   mentioning steps, percentages, and rationale bury the category signal that
+   the fixture's terse phrasing kept near the surface. The §5 conclusion
+   ("MiniLM can't separate raw descriptions") strengthens.
+2. **The `[CATEGORY]` prefix mitigation survives, at half the margin** (0.089
+   vs 0.130, threshold 0.05). It still rescues every class, but the headroom
+   over the bar shrinks from +0.08 to +0.04 — on genuinely messy live data
+   the pass is not safe to assume. The §5 circularity caveat stands unchanged.
+3. **New failure mode the clean fixture hid: the keyword router itself.**
+   9 of ~21 regularization-intent rows (~43%) route to the wrong category,
+   because realistic text names the *site* of a change ("dropout 0.1 on
+   attention outputs", "weight decay … embeddings excluded", "weight noise on
+   the FFN up-projection") and the router's priority order fires on the site
+   word first. The silhouette above is computed against these noisy labels —
+   which is operationally correct (live, the prefix would be applied to
+   whatever the router says) but means T5.2 compounds *two* live risks:
+   embedding separability **and** router quality. This directly supports the
+   Phase 2 preference for the §11 emergent coordinator (no router) and the
+   existing medium-term item to replace the keyword router with a learned one.
+4. What stays open: the same replay on *actual* run data, once a live loop
+   has produced any. This section changes the item from "unknown" to "bounded
+   from the friendly side": expect raw FAIL, prefixed marginal-PASS, and
+   substantial router noise.
+
+Run dir: `replay-20260703T012339`. Repro:
+
+```powershell
+uv run python -m scas.replay scas/fixtures/realistic_results.tsv
+```

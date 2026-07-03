@@ -1,0 +1,61 @@
+commit	val_bpb	memory_gb	status	description
+f3a9c21	0.997900	44.0	keep	first run after fork, no changes, establishing the baseline
+8b2d4ef	0.994100	44.2	keep	bump peak learning rate 3e-4 -> 4.5e-4, curve looked stable, hoping to buy faster early progress
+2c7f0aa	0.996800	44.2	discard	that lr spiked hard around step 900, backing off to 3.5e-4 and doubling warmup to 400 steps
+9d1e5bc	0.992300	44.5	keep	swap AdamW for Muon on the 2d hidden weights only, embeddings and lm head stay on AdamW
+4a8c3d0	0.991700	44.5	keep	muon momentum 0.95 -> 0.9 after seeing oscillation in the grad norms late in the run
+7e0b9f4	0.990900	44.5	keep	cosine decay to 10 percent of peak instead of linear-to-zero, late training was noisy
+1f6a2e8	0.993500	44.4	discard	try Lion for the whole net, halved the step size since Lion likes smaller updates
+5c9d7b3	0.991200	44.5	keep	Lion underperformed, reverting to the Muon+AdamW split from two commits ago
+0a4e8c6	0.989800	45.3	keep	increase depth 8 -> 12 layers keeping width fixed, params up roughly 40 percent
+3b7f1d9	0.000000	0.0	crash	12 layers OOMed at batch 64, adding activation checkpointing and retrying
+6d2a9e5	0.989100	45.1	keep	12 layers fits with checkpointing but throughput dropped 30 percent, going back to 10 layers as a compromise
+c8e4b07	0.988400	45.4	keep	widen FFN multiplier 4x -> 6x at 10 layers, capacity seems to want to live in the FFN
+a1d7f32	0.987600	45.4	keep	replace GeLU with SwiGLU in the FFN, standard trick, expecting a small win
+e5b0c48	0.987200	45.2	keep	SwiGLU win was real but tiny, also tying input and output embeddings to free params for the wider FFN
+b9f3a61	0.986500	45.2	keep	rotary embeddings instead of learned absolute positions
+d4c8e75	0.988000	45.5	discard	attention heads 8 -> 12 with head dim held at 64, no movement and slower
+7a2b5f0	0.986100	45.2	keep	pre-norm with RMSNorm everywhere, the post-norm config was diverging whenever I pushed the step size
+f0e6d93	0.985800	45.3	keep	add dropout 0.1 on attention and FFN outputs, the train/val gap opened up past 3k steps
+28c4a7e	0.986900	45.3	discard	dropout to 0.15 and label smoothing 0.1 while I'm at it, too much at once probably
+91b8d5c	0.985200	45.3	keep	weight decay 0.01 -> 0.1 on all linears, embeddings excluded
+64f0e2a	0.984900	45.3	keep	grad clip at 0.5 instead of 1.0, still seeing rare loss spikes
+37d9c1b	0.985500	45.4	discard	stochastic depth 0.1 on the deeper half of the layers, val got slightly worse
+50a3f86	0.984300	45.4	keep	weight decay 0.05 as the middle ground, nothing else changed
+83e7b04	0.984000	45.4	keep	back off label smoothing to 0.05, 0.1 was clearly hurting
+c6f1a29	0.983700	45.4	keep	add small gaussian weight noise std 0.01, poor man's regularizer, cheap to try
+19b5d7f	0.984600	45.5	discard	spectral norm on the QK projections to tame the logit growth, made no difference here
+42e8c30	0.983300	45.5	keep	random token masking at 5 percent as augmentation
+75a0f6d	0.000000	0.0	crash	double width to 1536 and 16 heads in one go (OOM, should have known)
+d8c2b41	0.982900	45.8	keep	width 1280 instead, fits with checkpointing, small but real gain
+0bf49e7	0.982500	45.8	keep	warmup 400 -> 800 steps, the wider net wants a gentler start
+3ae61c5	0.983800	45.8	discard	revert the last two changes, val regressed overnight and I can't tell which one did it
+66d94b8	0.982200	45.8	keep	rerun the current best config with a different data shard order to check run-to-run variance, kept the better of the two
+99f27a0	0.981800	45.8	keep	lower the peak to 3e-4 and add dropout 0.05 together, sweep budget doesn't allow separating them
+cc31e5d	0.981500	45.9	keep	decoupled weight decay for the Muon params, they were getting the AdamW-style decay by accident
+ff685b2	0.982400	45.9	discard	try LAMB since the effective batch is large, no win at this scale
+22a8d0f	0.981100	45.9	keep	one-cycle style schedule with a short cooldown at the end instead of plain cosine
+55c0f73	0.980800	46.0	keep	FFN multiplier 6x -> 8x now that width is 1280, checkpointing keeps it under budget
+88e42a6	0.981600	46.0	discard	depth 10 -> 14 as a counterpoint to going wider, worse per wall-clock, discarding
+bb17c94	0.980400	46.0	keep	attention dropout 0.05 separate from the residual dropout, gap was creeping again
+ee592d8	0.980100	46.0	keep	sequence length 1024 -> 2048 with the rotary base adjusted to match
+1148fab	0.979800	46.1	keep	gradient clipping back to 1.0, the 0.5 clip was biting on 2k sequences
+4472e09	0.980600	46.1	discard	sandwich norm (pre and post) on every block, slower and no better
+7796d3c	0.979400	46.1	keep	untie the embeddings again at this width, the tied setup was leaving loss on the table
+aaba06f	0.979100	46.2	keep	mixup alpha 0.2 on the embedding vectors, unusual for LM but it helped a hair
+ddde139	0.000000	0.0	crash	fused triton kernel for the SwiGLU FFN segfaulted on this driver version
+0102467	0.978800	46.2	keep	plain pytorch SwiGLU again, fused kernel abandoned, keeping the numerics
+343589a	0.978500	46.2	keep	beta2 0.999 -> 0.95 for AdamW on the embedding/head params, follows the muP folk wisdom
+6768bcd	0.979300	46.2	discard	cutmix prob 0.3 on token spans, seems wrong for LM loss, and the numbers agree
+9a9cef0	0.978200	46.3	keep	learning rate on the head 2x the body rate, split param groups properly this time
+cdcd023	0.977900	46.3	keep	RMSNorm eps 1e-5 -> 1e-6, tiny but consistent improvement on the longer runs
+f0f1356	0.978700	46.3	discard	QK-layernorm inside attention, stability was already fine so it just cost throughput
+2324689	0.977600	46.4	keep	dropout schedule, start at 0 and ramp to 0.1 by mid-training, best of both regimes
+56579bc	0.977300	46.4	keep	weight noise only on the FFN up-projection instead of everywhere
+898adef	0.977000	46.4	keep	warmup as a fraction (3 percent of total steps) instead of a fixed count, cleaner for the longer schedule
+bcbd022	0.977800	46.5	discard	label smoothing back on at 0.02, even that small amount hurts val_bpb here
+efef155	0.976700	46.5	keep	stochastic depth only on layers 8-10 with rate 0.05, gentler than the earlier attempt
+1213488	0.976400	46.5	keep	Muon on the QKV projections too, was only on the FFN weights before
+4546abb	0.976100	46.6	keep	extend the cosine tail, final lr 10 percent -> 5 percent of peak
+7879dee	0.976900	46.6	discard	8 percent token masking, past the sweet spot, 5 was better
+abab311	0.975800	46.6	keep	best config rerun end to end from scratch to confirm reproducibility before the next round
