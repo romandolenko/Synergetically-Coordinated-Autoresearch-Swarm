@@ -1,0 +1,101 @@
+{
+  "surrogate": "synthetic landscape seed=0 K'=5 noise=0 at MiniLM embeddings of real LLM-written cards",
+  "effective_alpha": {
+    "per_agent": {
+      "c0": {
+        "n_pairs_total": 8,
+        "refine": {
+          "n": 4,
+          "mean_margin": 0.28560972586274147,
+          "compliance": 1.0
+        },
+        "explore": {
+          "n": 2,
+          "mean_margin": 0.037702593952417374,
+          "compliance": 0.5
+        },
+        "refine_minus_explore_margin": 0.2479071319103241,
+        "note": "positive separation + high compliance => prompts steer the live agent the way bernoulli(alpha) steers the synthetic one"
+      },
+      "c1": {
+        "n_pairs_total": 8,
+        "refine": {
+          "n": 3,
+          "mean_margin": 0.21105589965979257,
+          "compliance": 1.0
+        },
+        "explore": {
+          "n": 3,
+          "mean_margin": -0.02412081944445769,
+          "compliance": 0.3333333333333333
+        },
+        "refine_minus_explore_margin": 0.23517671910425025,
+        "note": "positive separation + high compliance => prompts steer the live agent the way bernoulli(alpha) steers the synthetic one"
+      },
+      "c2": {
+        "n_pairs_total": 8,
+        "refine": {
+          "n": 4,
+          "mean_margin": 0.22322089225053787,
+          "compliance": 1.0
+        },
+        "explore": {
+          "n": 2,
+          "mean_margin": 0.00923793762922287,
+          "compliance": 0.5
+        },
+        "refine_minus_explore_margin": 0.213982954621315,
+        "note": "positive separation + high compliance => prompts steer the live agent the way bernoulli(alpha) steers the synthetic one"
+      }
+    },
+    "pooled": {
+      "refine": {
+        "n": 11,
+        "mean_margin": 0.24259001558477228,
+        "compliance": 1.0
+      },
+      "explore": {
+        "n": 7,
+        "mean_margin": 0.003074086404272487,
+        "compliance": 0.42857142857142855
+      }
+    },
+    "refine_minus_explore_margin": 0.2395159291804998
+  },
+  "coordinated": {
+    "n_reports": 24,
+    "n_rejected": 1,
+    "rejection_rate": 0.041666666666666664,
+    "separation": {
+      "n_cards": 23,
+      "n_groups": 3,
+      "group_sizes": {
+        "0": 3,
+        "1": 12,
+        "2": 8
+      },
+      "inter_centroid_dist": 0.6715533137321472,
+      "intra_dist": 0.7923895120620728,
+      "inter_over_intra": 0.8475040412694663,
+      "silhouette": 0.05484267324209213
+    }
+  },
+  "independent_null": {
+    "n_reports": 24,
+    "n_rejected": 1,
+    "rejection_rate": 0.041666666666666664,
+    "separation": {
+      "n_cards": 23,
+      "n_groups": 3,
+      "group_sizes": {
+        "0": 7,
+        "1": 9,
+        "2": 7
+      },
+      "inter_centroid_dist": 0.6003899574279785,
+      "intra_dist": 0.7847196459770203,
+      "inter_over_intra": 0.7651012186402688,
+      "silhouette": 0.044377803802490234
+    }
+  }
+}
