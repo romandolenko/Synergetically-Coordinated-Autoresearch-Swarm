@@ -156,6 +156,7 @@ class Landscape:
     base: float                 # baseline val_bpb
     noise_std: float            # per-call gaussian noise on evaluate()
     minima_strings: tuple[str, ...]  # provenance: the proposer strings that map to each mu_k
+    jackpot_index: int | None = None  # depth_dist="jackpot": which minimum is the deep one
 
 
 def all_templated_strings(categories: list[str] | None = None) -> list[str]:
@@ -183,6 +184,8 @@ def make_landscape(
     depth_range: tuple[float, float] = (0.04, 0.08),
     sigma: float = 0.5,
     noise_std: float = 0.005,
+    depth_dist: str = "uniform",
+    jackpot_depth: float = 0.5,
 ) -> Landscape:
     """Build a fixed landscape by sampling k_prime taxonomy strings as minima centers.
 
@@ -190,7 +193,15 @@ def make_landscape(
     can in principle reach them. Sampling is restricted to `categories` (the groups
     in use) so every minimum is coverable. The chosen strings are stored for
     provenance.
+
+    depth_dist="uniform" draws all depths from depth_range (unchanged committed
+    behavior). depth_dist="jackpot" then overwrites one rng-chosen minimum's depth
+    with jackpot_depth: best_val is dominated by whether that basin was ever
+    visited, so quality becomes a direct function of coverage — the benchmark
+    where "coverage speedup" has an efficiency payoff.
     """
+    if depth_dist not in ("uniform", "jackpot"):
+        raise ValueError(f"unknown depth_dist: {depth_dist}")
     rng = np.random.default_rng(seed)
     all_strings = all_templated_strings(categories)
     if k_prime > len(all_strings):
@@ -201,6 +212,10 @@ def make_landscape(
     chosen = [all_strings[int(i)] for i in idx]
     mu = np.stack([embedder.embed(s) for s in chosen]).astype(np.float32)
     depth = rng.uniform(depth_range[0], depth_range[1], size=k_prime).astype(np.float32)
+    jackpot_index: int | None = None
+    if depth_dist == "jackpot":
+        jackpot_index = int(rng.integers(k_prime))
+        depth[jackpot_index] = jackpot_depth
     sigmas = np.full(k_prime, sigma, dtype=np.float32)
     return Landscape(
         mu=mu,
@@ -209,6 +224,7 @@ def make_landscape(
         base=float(base),
         noise_std=float(noise_std),
         minima_strings=tuple(chosen),
+        jackpot_index=jackpot_index,
     )
 
 

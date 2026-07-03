@@ -643,3 +643,117 @@ foreach ($off in 0,100) {
     uv run python -m scas.sim --paired-seeds 20 --sct --emergent-groups --agents-per-group 3 --psi-0 1e9 --seed-offset $off
 }
 ```
+
+## 12. Coverage-causes-quality benchmark (2026-07-03) — the payoff exists, and only the engineered heuristic cashes it in
+
+Every result so far shares one blind spot, called out in the presentation's
+headline reading: best_val is flat within noise across all arms, so "coverage
+speedup" had no efficiency payoff to point at. Coverage could be a proxy for
+research quality or a mere activity metric — this landscape couldn't say.
+This section builds the landscape that can, then re-runs the full six-arm
+comparison on it.
+
+### 12a. Design
+
+**Jackpot depth distribution** (`--depth-dist jackpot`). The landscape
+machinery is unchanged except that one rng-chosen minimum's depth is
+overwritten with `--jackpot-depth 0.5` (background depths stay 0.04–0.08,
+base val_bpb 1.0). Best_val is then dominated by a single question — did the
+swarm ever visit the deep basin? — which makes quality causally downstream of
+coverage by construction. The uniform mode is byte-identical committed
+behavior (regression reproduces 44.8 / 1.39 / 2.0948 exactly; 43 unit tests
+pass, 4 new for the jackpot landscape).
+
+**Scarcity had to be engineered** (`--landscape-sigma`). At the committed
+σ=0.5, pilots found jackpot discovery saturating at 80–100% for every arm even
+with the budget cut to 15 steps: near-duplicate template strings (same base,
+different lr/momentum) sit inside the σ/2 visit radius, and `evaluate()` pays
+partial credit at a distance, so any broad sampling stumbles into the basin.
+Narrowing every basin to σ=0.30 shrinks the visit radius to 0.15 and removes
+distant partial credit; combined with the widest pool (G=6 categories,
+622 strings) and a modest budget (18 agents × 40 steps), baseline discovery
+lands at ~0.5 — the regime where arms can separate in either direction.
+
+**Protocol.** Operating point G=6, M=3/group, K'=10, steps=40, σ=0.30,
+jackpot depth 0.5. Six arms on identical seeds (random baseline, partition
+control, independent search, pure SCT law, SCT+search hybrid, engineered
+heuristic). This is the first experiment run under the multi-block rule §10
+motivated: **three disjoint 20-seed blocks** (offsets 0/100/200), pooled
+paired bootstrap (10k) over all 60 seeds.
+
+### 12b. Results
+
+**The benchmark works.** Within *every* arm, seeds that visited the jackpot
+basin end with best_val ≈ 0.13–0.16 lower (better) than seeds that never did
+(baseline link −0.140/−0.136/−0.138 across the three blocks — 26× the noise
+std). Coverage causes quality on this landscape; the missing link is now
+measurable.
+
+Pooled over 60 seeds (per-block rates shown because discovery is a coverage
+marginal, and coverage marginals carry block variance):
+
+| arm | jackpot rate b0/b1/b2 | pooled rate [CI95] | best_val Δ vs baseline [CI95] | within-arm link |
+| --- | --- | --- | --- | --- |
+| baseline | 0.45 / 0.55 / 0.70 | 0.57 [0.43, 0.68] | — (control) | −0.142 |
+| partition | 0.60 / 0.55 / 0.65 | 0.60 [0.47, 0.72] | −0.009 [−0.026, +0.006] | −0.145 |
+| independent | 0.65 / 0.60 / 0.80 | 0.68 [0.57, 0.80] | −0.016 [−0.038, +0.004] | −0.162 |
+| sct (pure law) | 0.65 / 0.60 / 0.55 | 0.60 [0.48, 0.73] | −0.017 [−0.041, +0.004] | −0.132 |
+| sct_search | 0.65 / 0.60 / 0.65 | 0.63 [0.52, 0.75] | −0.017 [−0.037, +0.001] | −0.134 |
+| **heuristic** | 0.70 / 0.70 / 0.60 | 0.67 [0.55, 0.78] | **−0.035 [−0.058, −0.014]** | −0.131 |
+
+Coverage speed at this operating point (marginal vs partition, per block):
+heuristic 2.58 [2.08, 3.14] / 2.33 [1.85, 2.92] / 1.69 [1.23, 2.38] — CI-low
+clears 1.5 in two blocks of three, so under the multi-block rule this is
+still *not* a robust ≥1.5× pass, consistent with §9d. The SCT arms remain the
+slowest coverers (pure-law marginal 0.72–0.91). Cohesion replicates tightly
+across blocks yet again (sct 2.85–2.94, heuristic 4.09–4.14).
+
+### 12c. Findings
+
+1. **Quality is now causally downstream of coverage — and the effect is
+   enormous relative to noise.** The within-arm found-vs-not contrast
+   (−0.13…−0.16 bpb) replicates in all six arms and all three blocks. The
+   presentation's caveat "this landscape does not stress the coverage→quality
+   link" is retired: this one does.
+2. **Only the engineered heuristic converts its coverage advantage into a
+   CI-solid quality gain** (−0.035 [−0.058, −0.014] vs baseline, roughly a
+   quarter of the maximum harvestable link). The novelty-search machinery
+   that wins coverage everywhere finally has an efficiency payoff to point
+   at — with the standing caveat that it requires a pre-embedded finite
+   candidate menu, which a live phase does not have.
+3. **The SCT law's coverage cost does not become a quality cost.** The pure
+   law is the slowest coverer here (marginal 0.72–0.91), yet its jackpot
+   discovery matches baseline (0.60 vs 0.57) and its best_val delta is
+   slightly *negative* (−0.017, CI crossing zero at +0.004 — any penalty is
+   bounded at ≈one noise-std). Slow breadth, but the exploit phase
+   concentrates evaluations around the deepest basin any group member finds,
+   which is exactly the samples that matter on this landscape. Quality
+   parity, not a quality win: the law remains an organization lever, not an
+   efficiency lever.
+4. **The block-variance pattern extends to jackpot discovery.** Baseline
+   discovery moved 0.45 → 0.70 across blocks — same instability the coverage
+   marginals have shown on every fresh-seed pass, and the reason this
+   experiment ran under the three-block protocol from the start. The pooled
+   60-seed CI is the honest number; a single 20-seed block could have
+   reported the heuristic's quality gain anywhere from dominant to absent.
+5. Committed defaults untouched (uniform depth path byte-identical;
+   regression 44.8 / 1.39 / 2.0948 exact; 43 tests pass).
+
+The live-phase implication sharpens Phase 2's arm choice: **if live research
+quality is coverage-limited, the quality lever is the search machinery, not
+the SCT coupling** — and the coupling can be layered on for its validated
+organization effects (cohesion §9, group formation §11) without paying a
+measurable quality tax. The two mechanisms are complementary, not competing.
+
+Run dirs: `compare-laws-N20-20260703T010136` (block 0), `-010219` (block
+100), `-010302` (block 200); pilots `compare-laws-N10-20260703T*`; regression
+`paired-N10-20260703T005459`; pooled aggregate with CIs in
+`sim_runs/coverage_quality_20260703.json`. Repro:
+
+```powershell
+# six arms, jackpot landscape, three disjoint 20-seed blocks
+foreach ($off in 0,100,200) {
+    uv run python -m scas.sim --compare-laws --paired-seeds 20 --depth-dist jackpot `
+        --steps 40 --K 6 --K-prime 10 --landscape-sigma 0.30 --seed-offset $off
+}
+```

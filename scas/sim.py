@@ -167,6 +167,9 @@ def _run_one(
     alpha_temp: float = 1.0,
     sct_search: bool = False,
     emergent_groups: bool = False,
+    depth_dist: str = "uniform",
+    jackpot_depth: float = 0.5,
+    landscape_sigma: float = 0.5,
 ) -> Path:
     assert mode in ("scas", "baseline", "partition")
     rng = np.random.default_rng(seed)
@@ -182,7 +185,8 @@ def _run_one(
     n_agents = n_groups * agents_per_group
 
     landscape = make_landscape(
-        seed=seed, k_prime=K_prime, embedder=embedder, categories=categories
+        seed=seed, k_prime=K_prime, embedder=embedder, categories=categories,
+        depth_dist=depth_dist, jackpot_depth=jackpot_depth, sigma=landscape_sigma,
     )
     agent_ids = [f"a{i}" for i in range(n_agents)]
 
@@ -299,6 +303,9 @@ def _run_one(
                 "alpha_temp": alpha_temp,
                 "sct_search": sct_search,
                 "emergent_groups": emergent_groups,
+                "depth_dist": depth_dist,
+                "jackpot_depth": jackpot_depth if depth_dist == "jackpot" else None,
+                "landscape_sigma": landscape_sigma,
             },
             indent=2,
         )
@@ -312,6 +319,7 @@ def _run_one(
                 "base": landscape.base,
                 "noise_std": landscape.noise_std,
                 "minima_strings": list(landscape.minima_strings),
+                "jackpot_index": landscape.jackpot_index,
             },
             indent=2,
         )
@@ -576,6 +584,12 @@ def _run_one(
         "K_prime": K_prime,
         "coupling_T": coupling_T,
     }
+    if landscape.jackpot_index is not None:
+        j = landscape.jackpot_index
+        summary["jackpot_index"] = j
+        summary["jackpot_depth"] = float(landscape.depth[j])
+        summary["jackpot_found"] = first_visit[j] is not None
+        summary["jackpot_first_visit_step"] = first_visit[j]
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return run_dir
 
@@ -610,6 +624,8 @@ def _aggregate(per_seed_dirs: list[Path], out_path: Path, mode: str) -> dict:
                 "steps_to_coverage": r["steps_to_coverage"],
                 "agent_step_budget": r["agent_step_budget"],
                 "K_prime": r["K_prime"],
+                "jackpot_found": r.get("jackpot_found"),
+                "jackpot_first_visit_step": r.get("jackpot_first_visit_step"),
             }
             for r, p in zip(rows, per_seed_dirs)
         ],
@@ -621,6 +637,9 @@ def _aggregate(per_seed_dirs: list[Path], out_path: Path, mode: str) -> dict:
         "mean_steps_to_80pct_coverage": float(np.mean(s80)),
         "mean_steps_to_100pct_coverage": float(np.mean(s100)),
     }
+    jp = [r.get("jackpot_found") for r in rows]
+    if all(v is not None for v in jp):
+        agg["jackpot_found_rate"] = float(np.mean([bool(v) for v in jp]))
     if mode in ("scas", "partition"):
         inters = [r["inter_group_dist"] for r in rows]
         intras = [r["intra_group_dist"] for r in rows]
@@ -657,6 +676,9 @@ def _run_paired_at_T(
     agents_per_group: int = 1,
     sct_search: bool = False,
     seed_offset: int = 0,
+    depth_dist: str = "uniform",
+    jackpot_depth: float = 0.5,
+    landscape_sigma: float = 0.5,
 ) -> tuple[dict, dict, Path]:
     """Run paired SCAS+baseline at a fixed T; return (scas_agg, baseline_agg, dir)."""
     sub = parent / f"T{coupling_T}"
@@ -667,11 +689,15 @@ def _run_paired_at_T(
         scas_dirs.append(
             _run_one(seed, "scas", K, K_prime, steps, coupling_T, sub, embedder,
                      w_p=w_p, psi_0=psi_0, sct=sct, alpha_temp=alpha_temp,
-                     agents_per_group=agents_per_group, sct_search=sct_search)
+                     agents_per_group=agents_per_group, sct_search=sct_search,
+                     depth_dist=depth_dist, jackpot_depth=jackpot_depth,
+                     landscape_sigma=landscape_sigma)
         )
         baseline_dirs.append(
             _run_one(seed, "baseline", K, K_prime, steps, coupling_T, sub, embedder,
-                     agents_per_group=agents_per_group)
+                     agents_per_group=agents_per_group,
+                     depth_dist=depth_dist, jackpot_depth=jackpot_depth,
+                     landscape_sigma=landscape_sigma)
         )
     scas_agg = _aggregate(scas_dirs, sub / "paired_scas_summary.json", "scas")
     baseline_agg = _aggregate(
@@ -694,6 +720,8 @@ def _run_sweep_T(args: argparse.Namespace, T_values: list[float]) -> Path:
             w_p=args.w_p, psi_0=args.psi_0, sct=args.sct, alpha_temp=args.alpha_temp,
             agents_per_group=args.agents_per_group, sct_search=args.sct_search,
             seed_offset=args.seed_offset,
+            depth_dist=args.depth_dist, jackpot_depth=args.jackpot_depth,
+            landscape_sigma=args.landscape_sigma,
         )
         s80_scas = scas_agg["mean_steps_to_80pct_coverage"]
         s80_base = baseline_agg["mean_steps_to_80pct_coverage"]
@@ -778,16 +806,22 @@ def _run_paired(args: argparse.Namespace) -> Path:
                      agents_per_group=apg, coverage_coupling=cc, embedding_repulsion=er,
                      shared_coverage=shared, anneal=args.anneal, anneal_start=args.anneal_start,
                      sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search,
-                     emergent_groups=args.emergent_groups)
+                     emergent_groups=args.emergent_groups,
+                     depth_dist=args.depth_dist, jackpot_depth=args.jackpot_depth,
+                     landscape_sigma=args.landscape_sigma)
         )
         baseline_dirs.append(
             _run_one(seed, "baseline", args.K, args.K_prime, args.steps, args.coupling_T,
-                     parent, embedder, agents_per_group=apg)
+                     parent, embedder, agents_per_group=apg,
+                     depth_dist=args.depth_dist, jackpot_depth=args.jackpot_depth,
+                     landscape_sigma=args.landscape_sigma)
         )
         if not args.no_partition_control:
             partition_dirs.append(
                 _run_one(seed, "partition", args.K, args.K_prime, args.steps, args.coupling_T,
-                         parent, embedder, agents_per_group=apg)
+                         parent, embedder, agents_per_group=apg,
+                         depth_dist=args.depth_dist, jackpot_depth=args.jackpot_depth,
+                         landscape_sigma=args.landscape_sigma)
             )
     scas_agg = _aggregate(scas_dirs, parent / "paired_scas_summary.json", "scas")
     baseline_agg = _aggregate(baseline_dirs, parent / "paired_baseline_summary.json", "baseline")
@@ -812,6 +846,10 @@ def _run_paired(args: argparse.Namespace) -> Path:
         "ac_b2_speedup_ratio": (s80_base / s80_scas) if s80_scas > 0 else None,
         "ac_b3_inter_over_intra_aggregate": scas_agg.get("inter_over_intra_aggregate"),
     }
+    if args.depth_dist == "jackpot":
+        headline["depth_dist"] = args.depth_dist
+        headline["scas_jackpot_found_rate"] = scas_agg.get("jackpot_found_rate")
+        headline["baseline_jackpot_found_rate"] = baseline_agg.get("jackpot_found_rate")
     if partition_dirs:
         part_agg = _aggregate(
             partition_dirs, parent / "paired_partition_summary.json", "partition"
@@ -883,7 +921,9 @@ def _compare_laws(args: argparse.Namespace) -> Path:
         sub.mkdir(parents=True, exist_ok=True)
         dirs = [
             _run_one(seed, mode, args.K, args.K_prime, args.steps, args.coupling_T,
-                     sub, embedder, agents_per_group=apg, **kw)
+                     sub, embedder, agents_per_group=apg,
+                     depth_dist=args.depth_dist, jackpot_depth=args.jackpot_depth,
+                     landscape_sigma=args.landscape_sigma, **kw)
             for seed in range(args.seed_offset, args.seed_offset + n)
         ]
         agg_mode = mode if mode in ("baseline", "partition") else "scas"
@@ -931,12 +971,12 @@ def _compare_laws(args: argparse.Namespace) -> Path:
                     "psi_0": args.psi_0, "alpha_temp": args.alpha_temp, "w_p": args.w_p,
                     "arms": {}}
     arm_data = (
-        ("independent", ind_s, ind_ioi, ind_b),
-        ("sct", sct_s, sct_ioi, sct_b),
-        ("sct_search", hyb_s, hyb_ioi, hyb_b),
-        ("heuristic", heur_s, heur_ioi, heur_b),
+        ("independent", independent, ind_s, ind_ioi, ind_b),
+        ("sct", sct, sct_s, sct_ioi, sct_b),
+        ("sct_search", sct_search, hyb_s, hyb_ioi, hyb_b),
+        ("heuristic", heuristic, heur_s, heur_ioi, heur_b),
     )
-    for name, s, ioi, b in arm_data:
+    for name, agg, s, ioi, b in arm_data:
         ac_b2_marg = _bootstrap(ratio, [part_s, s])
         ac_b2_head = _bootstrap(ratio, [base_s, s])
         ac_b3_abs = _bootstrap(lambda x: np.mean(x), [ioi])
@@ -950,6 +990,8 @@ def _compare_laws(args: argparse.Namespace) -> Path:
             "ac_b3_lift_vs_partition": {"point": ac_b3_lift[0], "ci95": [ac_b3_lift[1], ac_b3_lift[2]], "pass": ac_b3_lift[1] >= 0.5},
             "ac_b1_best_val_delta_vs_baseline": {"point": ac_b1_delta[0], "ci95": [ac_b1_delta[1], ac_b1_delta[2]]},
         }
+        if args.depth_dist == "jackpot":
+            report["arms"][name]["jackpot_found_rate"] = agg.get("jackpot_found_rate")
     # Direct head-to-heads on coverage speed (>1 ⇒ second arm faster).
     h2h = _bootstrap(ratio, [sct_s, heur_s])
     hyb_vs_heur = _bootstrap(ratio, [hyb_s, heur_s])
@@ -963,26 +1005,64 @@ def _compare_laws(args: argparse.Namespace) -> Path:
         "partition_inter_over_intra": float(np.mean(part_ioi)),
         "baseline_mean_best_val_bpb": float(np.mean(base_b)),
     }
+    if args.depth_dist == "jackpot":
+        report["depth_dist"] = "jackpot"
+        report["jackpot_depth"] = args.jackpot_depth
+        report["controls"]["baseline_jackpot_found_rate"] = baseline.get("jackpot_found_rate")
+        report["controls"]["partition_jackpot_found_rate"] = partition.get("jackpot_found_rate")
+        # Benchmark-validity check: within the random baseline, quality must be a
+        # function of whether the deep basin was covered. Strongly negative delta
+        # (about -jackpot_depth) => coverage causes quality on this landscape.
+        found = np.array(
+            [1.0 if r["jackpot_found"] else 0.0 for r in baseline["per_seed"]]
+        )
+        link_delta = (
+            float(np.mean(base_b[found == 1]) - np.mean(base_b[found == 0]))
+            if 0.0 < found.mean() < 1.0 else None
+        )
+        report["coverage_quality_link_baseline"] = {
+            "jackpot_found_rate": baseline.get("jackpot_found_rate"),
+            "best_val_delta_found_minus_not": link_delta,
+        }
     (parent / "comparison.json").write_text(json.dumps(report, indent=2))
 
     def _ci(d: dict) -> str:
         return f"{d['point']:.2f} [{d['ci95'][0]:.2f}, {d['ci95'][1]:.2f}]"
 
+    jackpot = args.depth_dist == "jackpot"
+    jp_hdr = f" {'jackpot%':>9}" if jackpot else ""
     print("\n=== Coordination-law comparison "
-          f"(N={n} seeds, G={args.K}, K'={args.K_prime}, M={apg}/group) ===")
+          f"(N={n} seeds, G={args.K}, K'={args.K_prime}, M={apg}/group"
+          f"{', depth_dist=jackpot' if jackpot else ''}) ===")
     print(f"{'arm':<10} {'steps_to80%':>11} {'AC-B2 marg vs part':>22} "
-          f"{'AC-B3 inter/intra':>20} {'AC-B3 lift':>18} {'best_val d':>14}")
+          f"{'AC-B3 inter/intra':>20} {'AC-B3 lift':>18} {'best_val d':>14}{jp_hdr}")
+
+    def _jp(agg: dict | None) -> str:
+        if not jackpot:
+            return ""
+        rate = (agg or {}).get("jackpot_found_rate")
+        return f" {rate:>9.2f}" if rate is not None else f" {'-':>9}"
+
     print(f"{'baseline':<10} {np.mean(base_s):>11.1f} {'- (control)':>22} "
-          f"{'-':>20} {'-':>18} {'-':>14}")
+          f"{'-':>20} {'-':>18} {'-':>14}{_jp(baseline)}")
     print(f"{'partition':<10} {np.mean(part_s):>11.1f} {'1.00 (control)':>22} "
-          f"{np.mean(part_ioi):>20.2f} {'0.00 (control)':>18} {'-':>14}")
+          f"{np.mean(part_ioi):>20.2f} {'0.00 (control)':>18} {'-':>14}{_jp(partition)}")
+    arm_aggs = {"independent": independent, "sct": sct,
+                "sct_search": sct_search, "heuristic": heuristic}
     for name in ("independent", "sct", "sct_search", "heuristic"):
         a = report["arms"][name]
         print(f"{name:<11} {a['mean_steps_to_80pct']:>10.1f} "
               f"{_ci(a['ac_b2_marginal_vs_partition']):>22} "
               f"{_ci(a['ac_b3_inter_over_intra']):>20} "
               f"{_ci(a['ac_b3_lift_vs_partition']):>18} "
-              f"{a['ac_b1_best_val_delta_vs_baseline']['point']:>+14.4f}")
+              f"{a['ac_b1_best_val_delta_vs_baseline']['point']:>+14.4f}"
+              f"{_jp(arm_aggs[name])}")
+    if jackpot:
+        link = report["coverage_quality_link_baseline"]
+        d = link["best_val_delta_found_minus_not"]
+        print(f"coverage->quality link (baseline arm): best_val(found) - best_val(not) = "
+              f"{d:+.4f}" if d is not None else
+              "coverage->quality link: baseline jackpot rate is 0 or 1; no within-arm contrast")
     print(f"\nindependent=farthest-point search w/o coordination (control); "
           f"sct=pure law (global explore); sct_search=law gating farthest-point "
           f"search (no anneal); heuristic=search+gating+anneal.")
@@ -1093,6 +1173,26 @@ def _parse_args() -> argparse.Namespace:
              "(no exploit cap, no anneal). Implies --sct.",
     )
     p.add_argument(
+        "--depth-dist", type=str, default="uniform", dest="depth_dist",
+        choices=["uniform", "jackpot"],
+        help="minima depth distribution: 'uniform' = committed default (all depths "
+             "0.04-0.08, best_val flat across arms); 'jackpot' = one rng-chosen "
+             "minimum gets --jackpot-depth instead, so best_val is dominated by "
+             "whether coverage ever found that basin (coverage->quality benchmark)",
+    )
+    p.add_argument(
+        "--jackpot-depth", type=float, default=0.5, dest="jackpot_depth",
+        help="depth of the single deep minimum under --depth-dist jackpot "
+             "(default 0.5 vs the 0.04-0.08 background; base val_bpb is 1.0)",
+    )
+    p.add_argument(
+        "--landscape-sigma", type=float, default=0.5, dest="landscape_sigma",
+        help="Gaussian basin width of every minimum (default 0.5 = committed). "
+             "Narrower basins make discovery scarce: near-duplicate taxonomy "
+             "strings stop counting as visits (radius = sigma/2) and evaluate() "
+             "stops giving partial credit at a distance",
+    )
+    p.add_argument(
         "--emergent-groups", action="store_true", dest="emergent_groups",
         help="drop the hand-assigned category partition: agents draw from the "
              "pooled cross-category menu and group membership is emergent "
@@ -1172,6 +1272,8 @@ def main() -> None:
         anneal=args.anneal, anneal_start=args.anneal_start,
         sct=args.sct, alpha_temp=args.alpha_temp, sct_search=args.sct_search,
         emergent_groups=args.emergent_groups,
+        depth_dist=args.depth_dist, jackpot_depth=args.jackpot_depth,
+        landscape_sigma=args.landscape_sigma,
     )
     summary = json.loads((run_dir / "summary.json").read_text())
     print(json.dumps({"run_dir": str(run_dir), **summary}, indent=2))

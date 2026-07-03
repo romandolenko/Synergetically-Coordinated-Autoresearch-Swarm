@@ -17,7 +17,7 @@ from scas.coordinator import (
     compute_psi,
 )
 from scas.sim import _first_visit_steps, _select_embedding, _steps_to_coverage
-from scas.synthetic import Landscape
+from scas.synthetic import Landscape, evaluate, make_landscape
 
 
 def _unit(v: list[float]) -> np.ndarray:
@@ -197,6 +197,62 @@ def test_select_embedding_uniform_when_nothing_covered():
     rng = np.random.default_rng(0)
     seen = {_select_embedding(cands, none_cov, False, None, rng) for _ in range(50)}
     assert seen == {0, 1, 2}
+
+
+# ------------------------------------------------- jackpot depth distribution
+
+
+class _HashEmbedder:
+    """Deterministic stand-in for MiniLM: hash the string into a unit vector."""
+
+    def embed(self, s: str) -> np.ndarray:
+        rng = np.random.default_rng(abs(hash(s)) % (2**32))
+        v = rng.normal(size=8).astype(np.float32)
+        return v / np.linalg.norm(v)
+
+
+def test_jackpot_landscape_one_deep_minimum_rest_unchanged():
+    uni = make_landscape(seed=7, k_prime=6, embedder=_HashEmbedder())
+    jack = make_landscape(seed=7, k_prime=6, embedder=_HashEmbedder(),
+                          depth_dist="jackpot", jackpot_depth=0.5)
+    # uniform mode is byte-identical committed behavior and carries no jackpot
+    assert uni.jackpot_index is None
+    assert all(0.04 <= d <= 0.08 for d in uni.depth)
+    # jackpot mode: same centers and background depths, one overwritten deep one
+    j = jack.jackpot_index
+    assert j is not None and 0 <= j < 6
+    assert jack.minima_strings == uni.minima_strings
+    np.testing.assert_array_equal(jack.mu, uni.mu)
+    assert jack.depth[j] == pytest.approx(0.5)
+    mask = np.arange(6) != j
+    np.testing.assert_array_equal(jack.depth[mask], uni.depth[mask])
+
+
+def test_jackpot_index_is_seed_deterministic():
+    a = make_landscape(seed=3, k_prime=5, embedder=_HashEmbedder(), depth_dist="jackpot")
+    b = make_landscape(seed=3, k_prime=5, embedder=_HashEmbedder(), depth_dist="jackpot")
+    assert a.jackpot_index == b.jackpot_index
+
+
+def test_jackpot_quality_requires_visiting_the_deep_basin():
+    """The benchmark's causal mechanism: best_val near the jackpot beats best_val
+    at any shallow minimum by ~jackpot_depth, far above the noise floor."""
+    ls = make_landscape(seed=11, k_prime=5, embedder=_HashEmbedder(),
+                        depth_dist="jackpot", jackpot_depth=0.5)
+    rng = np.random.default_rng(0)
+    j = ls.jackpot_index
+    at_jackpot = evaluate(ls.mu[j], ls, rng)
+    at_shallow = min(
+        evaluate(ls.mu[k], ls, rng) for k in range(5) if k != j
+    )
+    assert at_jackpot < ls.base - 0.4          # deep basin dominates
+    assert at_shallow > ls.base - 0.2          # shallow minima cannot substitute
+    assert at_shallow - at_jackpot > 0.25      # gap >> noise_std=0.005
+
+
+def test_make_landscape_rejects_unknown_depth_dist():
+    with pytest.raises(ValueError, match="depth_dist"):
+        make_landscape(seed=0, k_prime=3, embedder=_HashEmbedder(), depth_dist="pareto")
 
 
 # ----------------------------------------------------------- coverage metrics
