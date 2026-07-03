@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import sqlite3
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,10 @@ class Embedder:
     ):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._model_name = model_name
-        self._conn = sqlite3.connect(str(cache_path))
+        # check_same_thread=False + the lock below: the live service
+        # (scas/service.py) calls embed() from HTTP worker threads.
+        self._conn = sqlite3.connect(str(cache_path), check_same_thread=False)
+        self._lock = threading.Lock()
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS embeddings ("
             "key TEXT PRIMARY KEY, vec BLOB NOT NULL)"
@@ -49,21 +53,22 @@ class Embedder:
 
     def embed(self, text: str) -> np.ndarray:
         k = _key(self._model_name, text)
-        row = self._conn.execute(
-            "SELECT vec FROM embeddings WHERE key = ?", (k,)
-        ).fetchone()
-        if row is not None:
-            self.hits += 1
-            return np.load(io.BytesIO(row[0]), allow_pickle=False)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT vec FROM embeddings WHERE key = ?", (k,)
+            ).fetchone()
+            if row is not None:
+                self.hits += 1
+                return np.load(io.BytesIO(row[0]), allow_pickle=False)
 
-        self._ensure_model()
-        vec = self._model.encode(text, normalize_embeddings=True).astype(np.float32)
-        buf = io.BytesIO()
-        np.save(buf, vec, allow_pickle=False)
-        self._conn.execute(
-            "INSERT OR REPLACE INTO embeddings (key, vec) VALUES (?, ?)",
-            (k, buf.getvalue()),
-        )
-        self._conn.commit()
-        self.misses += 1
-        return vec
+            self._ensure_model()
+            vec = self._model.encode(text, normalize_embeddings=True).astype(np.float32)
+            buf = io.BytesIO()
+            np.save(buf, vec, allow_pickle=False)
+            self._conn.execute(
+                "INSERT OR REPLACE INTO embeddings (key, vec) VALUES (?, ?)",
+                (k, buf.getvalue()),
+            )
+            self._conn.commit()
+            self.misses += 1
+            return vec
