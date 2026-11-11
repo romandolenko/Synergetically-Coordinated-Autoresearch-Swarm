@@ -33,6 +33,9 @@ python tools/vast/vastctl.py provision             # clone, uv sync, prepare.py,
 python tools/vast/vastctl.py sweep --hours 6       # detached; 3 baseline repeats + 25 experiments
 python tools/vast/vastctl.py logs -f               # watch
 python tools/vast/vastctl.py status                # uptime + spend so far
+python tools/vast/vastctl.py finish                # wait, fetch + verify, then DESTROY the box
+
+# or do the last step by hand:
 python tools/vast/vastctl.py fetch                 # -> vast_runs/<label>-<ts>/
 python tools/vast/vastctl.py down                  # DESTROY (stop paying)
 
@@ -40,6 +43,15 @@ uv run python tools/vast/analyze.py vast_runs/<label>-<ts>/results.tsv
 ```
 
 `down` is the one that stops the meter. `stop-sweep` only kills the experiment loop.
+
+`finish` (or `sweep --auto-down`, which runs it straight after launching) polls until the
+sweep process exits, downloads the results, and destroys the instance **only if** the
+sweep log ends with its `=== done` line and the local copy checks out: `results.tsv` has
+the same line count as on the box, `sweep_state.json` agrees with it, and `runs/` came
+down. If any check fails, or the box stops answering, it leaves the instance running and
+exits non-zero, so a crashed sweep can be resumed. `--keep` verifies without destroying.
+It runs on your machine, so it must stay awake and online until the sweep ends; nothing
+on the box can shut the instance down by itself.
 
 ### Cost
 

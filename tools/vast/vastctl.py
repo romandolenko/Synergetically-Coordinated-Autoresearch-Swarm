@@ -11,6 +11,8 @@ Typical session:
     python tools/vast/vastctl.py provision           # uv sync + prepare.py + smoke test
     python tools/vast/vastctl.py sweep --hours 6     # run the experiment plan, detached
     python tools/vast/vastctl.py logs -f             # watch it
+    python tools/vast/vastctl.py finish              # wait, fetch + verify, DESTROY the box
+    # ...or manually:
     python tools/vast/vastctl.py fetch               # pull results.tsv + logs down
     python tools/vast/vastctl.py down                # DESTROY the box (stop paying)
 
@@ -480,6 +482,11 @@ def cmd_sweep(args):
     state["sweep_hours"] = args.hours
     save_state(state)
     info("sweep detached. Watch with: python tools/vast/vastctl.py logs -f")
+    if args.auto_down and not args.dry_run:
+        info("--auto-down: staying attached; will fetch results and destroy the box "
+             "when the sweep completes")
+        time.sleep(20)  # let the sweep process appear before the first poll
+        cmd_finish(argparse.Namespace(poll=args.poll, max_misses=10, out=None, keep=False))
 
 
 def cmd_logs(args):
@@ -525,6 +532,96 @@ def cmd_fetch(args):
     (out / "instance.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     info("artifacts -> " + str(out))
     print("\nNext: python tools/vast/analyze.py \"%s\"" % (out / "results.tsv"))
+    return out
+
+
+def _remote_out(state, remote_cmd):
+    """Run a remote command quietly. Returns stdout, or None if ssh itself failed."""
+    proc = subprocess.run(ssh_base(state) + [remote_cmd], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout or ""
+
+
+def cmd_finish(args):
+    """Wait for the sweep to end, save the results locally, then destroy the box.
+
+    The instance is destroyed ONLY when the sweep ended normally and the local
+    copy is verified against the box. Anything else leaves it running (and
+    billing) so nothing is lost, and exits non-zero.
+    """
+    state = require_instance()
+    info("waiting for the sweep to finish (poll every %ds)" % args.poll)
+    misses = 0
+    while True:
+        out = _remote_out(
+            state,
+            "pgrep -f '[s]weep.py' >/dev/null && echo SWEEP_ALIVE || echo SWEEP_GONE; "
+            "tail -n 1 %s 2>/dev/null" % SWEEP_LOG,
+        )
+        if out is None or ("SWEEP_ALIVE" not in out and "SWEEP_GONE" not in out):
+            # an unreachable box is not a finished sweep
+            misses += 1
+            if misses >= args.max_misses:
+                die("lost contact with the instance (%d failed polls). It is STILL "
+                    "RUNNING and billing; re-run `vastctl finish` or check `vastctl status`."
+                    % misses)
+            info("  ssh poll failed (%d/%d), retrying" % (misses, args.max_misses))
+        else:
+            misses = 0
+            last = out.strip().splitlines()[-1][:110] if out.strip() else ""
+            if "SWEEP_GONE" in out:
+                break
+            info("  running: " + last)
+        time.sleep(args.poll)
+
+    log_tail = _remote_out(state, "tail -n 5 %s 2>/dev/null" % SWEEP_LOG) or ""
+    clean = "=== done:" in log_tail
+    if not clean:
+        info("sweep process is gone but the log has no '=== done' line:")
+        print(log_tail)
+
+    out_dir = cmd_fetch(argparse.Namespace(out=args.out))
+
+    # verify the local copy before anything irreversible
+    problems = []
+    tsv = out_dir / "results.tsv"
+    remote_lines = _remote_out(state, "wc -l < %s/results.tsv" % REMOTE_REPO)
+    if not tsv.is_file():
+        problems.append("results.tsv was not downloaded")
+    elif remote_lines is None or not remote_lines.strip().isdigit():
+        problems.append("could not read the remote results.tsv to compare")
+    else:
+        local_lines = tsv.read_bytes().count(b"\n")
+        if local_lines != int(remote_lines.strip()) or local_lines < 2:
+            problems.append("results.tsv has %d lines locally vs %s on the box"
+                            % (local_lines, remote_lines.strip()))
+    try:
+        # experiments skipped for a bad edit are in the state but never get a tsv row
+        n_state = sum(1 for e in json.loads((out_dir / "sweep_state.json").read_text(
+            encoding="utf-8"))["experiments"] if e.get("status") != "skipped")
+        if tsv.is_file() and n_state != tsv.read_bytes().count(b"\n") - 1:
+            problems.append("sweep_state.json has %d experiments but results.tsv has %d rows"
+                            % (n_state, tsv.read_bytes().count(b"\n") - 1))
+    except (OSError, ValueError, KeyError) as err:
+        problems.append("sweep_state.json missing or unreadable (%s)" % err)
+    if not (out_dir / "runs").is_dir():
+        problems.append("runs/ (per-experiment logs) was not downloaded")
+    if not clean:
+        problems.append("the sweep did not end normally (crashed or was killed)")
+
+    if problems:
+        for p in problems:
+            info("NOT destroying: " + p)
+        die("instance %s left RUNNING and billing. Results so far are in %s. "
+            "Fix or `vastctl sweep --resume`, or destroy it with `vastctl down`."
+            % (state["instance_id"], out_dir))
+
+    info("results verified in %s" % out_dir)
+    if args.keep:
+        info("--keep given: instance left running. Destroy it with `vastctl down`.")
+        return
+    cmd_down(argparse.Namespace(yes=True, instance=None))
 
 
 def cmd_down(args):
@@ -613,7 +710,21 @@ def main():
     sp.add_argument("--min-improvement", default="auto",
                     help="keep threshold: a number, or 'auto' = 2x baseline std")
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--auto-down", action="store_true",
+                    help="stay attached, then fetch results and DESTROY the box when "
+                         "the sweep completes (same as running `finish` afterwards)")
+    sp.add_argument("--poll", type=int, default=120, help="--auto-down poll seconds")
     sp.set_defaults(func=cmd_sweep)
+
+    sp = sub.add_parser("finish", help="wait for the sweep, fetch + verify results, "
+                                       "then DESTROY the instance")
+    sp.add_argument("--poll", type=int, default=120, help="seconds between checks")
+    sp.add_argument("--max-misses", type=int, default=10,
+                    help="consecutive failed ssh polls before giving up (box stays up)")
+    sp.add_argument("--out", default=None, help="local directory for the results")
+    sp.add_argument("--keep", action="store_true",
+                    help="fetch and verify but do not destroy")
+    sp.set_defaults(func=cmd_finish)
 
     sp = sub.add_parser("logs", help="tail the sweep (or provision) log")
     sp.add_argument("-f", "--follow", action="store_true")
