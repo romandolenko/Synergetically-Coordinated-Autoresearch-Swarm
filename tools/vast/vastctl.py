@@ -241,7 +241,8 @@ def build_query(args):
         "cuda_max_good>=" + str(args.cuda),
         # tokenisation runs on CPU every step; a starved box throttles the GPU
         "cpu_cores_effective>=" + str(args.cpu_cores),
-    ])
+    ] + (["geolocation notin [%s]" % args.exclude_countries]
+         if args.exclude_countries else []))
 
 
 def search_offers(args):
@@ -433,7 +434,9 @@ def cmd_provision(args):
     smoke = "--skip-smoke" if args.skip_smoke else ""
     ssh_run(
         state,
-        "bash %s/provision.sh %s %s %s %s 2>&1 | tee %s/provision.log"
+        # pipefail: without it the pipeline reports tee's exit status and a failed
+        # provision is announced as a success
+        "set -o pipefail; bash %s/provision.sh %s %s %s %s 2>&1 | tee %s/provision.log"
         % (REMOTE_TOOLS, args.repo, args.branch, args.dataset, smoke, REMOTE_WORK),
         stream=True,
     )
@@ -668,6 +671,10 @@ def main():
         sp.add_argument("--cuda", type=float, default=12.4, help="min cuda_max_good")
         sp.add_argument("--cpu-cores", type=float, default=8.0,
                         help="min effective CPU cores (tokenisation is CPU-bound)")
+        sp.add_argument("--exclude-countries", default="CN",
+                        help="comma-separated country codes to skip ('' for none). "
+                             "Default CN: a box there failed provisioning with "
+                             "corrupted PyPI downloads (hash mismatch)")
         sp.add_argument("--limit", type=int, default=10)
 
     sp = sub.add_parser("keys", help="create/register the ssh keypair")
