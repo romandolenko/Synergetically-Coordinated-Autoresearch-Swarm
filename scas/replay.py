@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -84,18 +85,43 @@ def _ensure_sample_tsv(path: Path) -> Path:
     return path
 
 
-def _category_for(description: str) -> str:
+UNKNOWN = "unknown"
+
+
+def _kw_pattern(kw: str):
+    """Anchor a keyword at a word start. Unanchored substring matching fired
+    'rope' inside "properly" and 'head' inside "ahead" on real cards. Suffixes
+    stay open ('embed' still matches "embeddings") unless the keyword was
+    written with a trailing space/'=' ("lr ", "tie "), which closes it."""
+    core = kw.rstrip(" ")
+    closed = kw != core
+    pat = r"(?<![a-z0-9])" + re.escape(core)
+    if closed:
+        pat += r"(?![a-z0-9])"
+    return re.compile(pat)
+
+
+_ROUTES = [
+    (label, [(k, _kw_pattern(k)) for k in kws])
+    for label, kws in (("optimizer", _OPT_KWS), ("architecture", _ARCH_KWS),
+                       ("regularization", _REG_KWS))
+]
+
+
+def route(description: str) -> tuple[str, str | None]:
+    """(category, deciding keyword). No keyword -> (UNKNOWN, None): the old
+    silent fallback to "optimizer" hid that the router was guessing (it put
+    3/5 real regularization cards there)."""
     d = description.lower()
-    for k in _OPT_KWS:
-        if k in d:
-            return "optimizer"
-    for k in _ARCH_KWS:
-        if k in d:
-            return "architecture"
-    for k in _REG_KWS:
-        if k in d:
-            return "regularization"
-    return "optimizer"  # fallback (e.g. "baseline")
+    for label, kws in _ROUTES:
+        for k, pat in kws:
+            if pat.search(d):
+                return label, k
+    return UNKNOWN, None
+
+
+def _category_for(description: str) -> str:
+    return route(description)[0]
 
 
 def replay(tsv_path: Path, coupling_T: float = 1.0) -> tuple[Path, dict]:
@@ -113,11 +139,20 @@ def replay(tsv_path: Path, coupling_T: float = 1.0) -> tuple[Path, dict]:
     embeddings: list[np.ndarray] = []
     embeddings_prefixed: list[np.ndarray] = []
     cat_labels: list[str] = []
+    n_unknown = 0
 
     with trace_path.open("w") as f:
         for step, r in enumerate(rows):
             desc = r["description"]
             cat = _category_for(desc)
+            if cat == UNKNOWN:
+                # not routed: stays out of the coordinator and the silhouette
+                n_unknown += 1
+                f.write(json.dumps({
+                    "step": step, "commit": r.get("commit"), "description": desc,
+                    "category_assigned": UNKNOWN, "accepted": False,
+                }) + "\n")
+                continue
             agent_id = agents[CATEGORIES.index(cat)]
             emb = embedder.embed(desc)
             # Review concern #5: test the proposed live-phase mitigation —
@@ -188,6 +223,7 @@ def replay(tsv_path: Path, coupling_T: float = 1.0) -> tuple[Path, dict]:
 
     threshold = 0.05
     counts = {c: cat_labels.count(c) for c in CATEGORIES}
+    counts[UNKNOWN] = n_unknown
     summary = {
         "tsv": str(tsv_path),
         "n_rows": len(rows),

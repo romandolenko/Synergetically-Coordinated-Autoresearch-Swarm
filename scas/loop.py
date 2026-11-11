@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import subprocess
 import sys
@@ -111,9 +112,11 @@ class LoopClient:
         server: str = DEFAULT_SERVER,
         state_dir: Path = DEFAULT_STATE_DIR,
         rng: random.Random | None = None,
+        token: str | None = None,
     ):
         self.agent_id = agent_id
         self.server = server.rstrip("/")
+        self.token = token
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.state_dir / f"{agent_id}.json"
@@ -157,6 +160,7 @@ class LoopClient:
         status: str = "keep",
         step: int | None = None,
         files_changed: list[str] | None = None,
+        incumbent: float | None = None,
     ) -> dict:
         import requests
 
@@ -174,9 +178,15 @@ class LoopClient:
         }
         if step is not None:
             payload["step"] = step
+        if incumbent is not None:
+            # best val_bpb this agent had kept BEFORE this experiment; the
+            # coordinator ranks the card by its improvement over that
+            payload["incumbent_val_bpb"] = incumbent
         if prev is not None and prev.get("step") is not None:
             payload["parent_step"] = prev["step"]
-        r = requests.post(f"{self.server}/step", json=payload, timeout=120)
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        r = requests.post(f"{self.server}/step", json=payload, headers=headers,
+                          timeout=120)
         response = r.json()
         if r.status_code != 200:
             raise RuntimeError(f"service returned {r.status_code}: {response}")
@@ -206,10 +216,20 @@ def read_last_tsv_row(path: Path) -> dict:
     if not rows:
         raise ValueError(f"{path} has no data rows")
     r = rows[-1]
+
+    def _val(row) -> float:
+        try:
+            return float(row.get("val_bpb", "0") or "0")
+        except ValueError:
+            return 0.0
+
+    kept_before = [_val(x) for x in rows[:-1]
+                   if x.get("status") == "keep" and _val(x) > 0.0]
     return {
         "summary": r["description"],
-        "val_bpb": float(r.get("val_bpb", "0") or "0"),
+        "val_bpb": _val(r),
         "status": r.get("status", "keep"),
+        "incumbent": min(kept_before) if kept_before else None,
     }
 
 
@@ -284,6 +304,8 @@ def main() -> None:
     p.add_argument("--agent", required=True, dest="agent_id")
     p.add_argument("--server", default=DEFAULT_SERVER)
     p.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR), dest="state_dir")
+    p.add_argument("--token", default=os.environ.get("SCAS_TOKEN"),
+                   help="bearer token for a remote coordinator (default: $SCAS_TOKEN)")
     p.add_argument("--seed", type=int, default=None,
                    help="seed the bernoulli(alpha) draw (reproducible packets)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -297,6 +319,9 @@ def main() -> None:
     rp.add_argument("--val-bpb", type=float, default=None, dest="val_bpb")
     rp.add_argument("--status", default="keep", choices=["keep", "discard", "crash"])
     rp.add_argument("--step", type=int, default=None)
+    rp.add_argument("--incumbent", type=float, default=None,
+                    help="best val_bpb kept before this experiment "
+                         "(--from-tsv derives it from the earlier keep rows)")
     rp.add_argument("--files-changed", default=None, dest="files_changed",
                     help="comma-separated override (default: git diff HEAD~1 HEAD)")
 
@@ -305,7 +330,7 @@ def main() -> None:
     args = p.parse_args()
     rng = random.Random(args.seed) if args.seed is not None else random.Random()
     client = LoopClient(args.agent_id, server=args.server,
-                        state_dir=Path(args.state_dir), rng=rng)
+                        state_dir=Path(args.state_dir), rng=rng, token=args.token)
 
     if args.cmd == "prompt":
         print(client.prompt())
@@ -317,6 +342,8 @@ def main() -> None:
         elif args.summary is not None and args.val_bpb is not None:
             fields = {"summary": args.summary, "val_bpb": args.val_bpb,
                       "status": args.status}
+        if args.incumbent is not None:
+            fields["incumbent"] = args.incumbent
         else:
             p.error("report needs --from-tsv or both --summary and --val-bpb")
         files = ([f.strip() for f in args.files_changed.split(",") if f.strip()]

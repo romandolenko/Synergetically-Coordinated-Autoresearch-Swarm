@@ -155,7 +155,10 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 checkpoint_modes=(True,),
                 default_checkpointing=True,
             )
-        if gpu_vram_gb < 24.0:
+        # 23.0, not 24.0: a "24 GB" card reports ~23.5 GiB (an RTX 4090 gives
+        # 25252724736 bytes), so a 24.0 cut-off put every 24 GB card in the
+        # 16 GB tier and withheld the batch-64 autotune candidate.
+        if gpu_vram_gb < 23.0:
             return GpuProfile(
                 name=f"{arch}-16gb",
                 is_supported_consumer=True,

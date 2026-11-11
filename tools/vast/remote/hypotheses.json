@@ -1,0 +1,168 @@
+{
+  "name": "s1-constant-sweep-v1",
+  "purpose": "Produce a real results.tsv on real train.py / real GPU (review S1). Deterministic proposer stands in for the LLM so the numeric half of S1 lands without agent plumbing.",
+  "notes": [
+    "Descriptions are written in agent-card voice on purpose, but they are AUTHORED, not LLM-generated. Silhouette measured on this data bounds card diversity from above; it does not replace real LLM cards (review C1/S1).",
+    "DEVICE_BATCH_SIZE and EVAL_BATCH_SIZE are deliberately absent: on a supported consumer GPU the fork's autotune picks the train batch from gpu_profile.train_batch_candidates (train.py:857) and the eval batch from gpu_profile.eval_batch_cap (train.py:1298), so editing those module constants is a silent no-op.",
+    "category is the GROUND-TRUTH label. scas.replay re-derives a label by keyword; analyze.py reports the disagreement, which is the first real measurement of the router's error rate (review C1 cites ~43% on one class from fixtures).",
+    "Every value for a given constant is distinct across the plan, so a kept edit can never make a later edit a no-op.",
+    "The loop is keep-or-revert against the running best, exactly as program.md prescribes, so later experiments compose on top of earlier wins."
+  ],
+  "experiments": [
+    {
+      "id": "baseline",
+      "category": "baseline",
+      "description": "first run after clone, no changes, establishing the baseline val_bpb for this GPU"
+    },
+    {
+      "id": "opt-matrix-lr-up",
+      "category": "optimizer",
+      "edits": {"MATRIX_LR": "0.06"},
+      "description": "raise the Muon matrix learning rate from 0.04 to 0.06, the loss curve looked under-driven early so more step size should buy faster progress inside the budget"
+    },
+    {
+      "id": "arch-depth-10",
+      "category": "architecture",
+      "edits": {"DEPTH": "10"},
+      "description": "go deeper, 8 to 10 transformer layers, trading steps for capacity now that the budget is fixed"
+    },
+    {
+      "id": "reg-wd-light",
+      "category": "regularization",
+      "edits": {"WEIGHT_DECAY": "0.05"},
+      "description": "back the decay penalty right off to 0.05, at this token count the model is almost certainly underfitting rather than overfitting"
+    },
+    {
+      "id": "opt-warmup-short",
+      "category": "optimizer",
+      "edits": {"WARMUP_RATIO": "0.02"},
+      "description": "add a short warmup over the first 2 percent of the schedule to stop the early updates from thrashing the embeddings"
+    },
+    {
+      "id": "arch-window-all-full",
+      "category": "architecture",
+      "edits": {"WINDOW_PATTERN": "\"L\""},
+      "description": "drop the banded sliding-window layers and give every block full causal attention over the whole context"
+    },
+    {
+      "id": "opt-embedding-lr-up",
+      "category": "optimizer",
+      "edits": {"EMBEDDING_LR": "0.9"},
+      "description": "push the embedding learning rate to 0.9, token embeddings converge slowly and they are cheap to move"
+    },
+    {
+      "id": "reg-wd-heavy",
+      "category": "regularization",
+      "edits": {"WEIGHT_DECAY": "0.4"},
+      "description": "double the decay penalty instead, testing the opposite hypothesis that shrinking weights keeps the matrices better conditioned for Muon"
+    },
+    {
+      "id": "arch-aspect-wide",
+      "category": "architecture",
+      "edits": {"ASPECT_RATIO": "96"},
+      "description": "widen the residual stream, aspect ratio 64 to 96, favouring width over depth at constant layer count"
+    },
+    {
+      "id": "opt-betas-slower",
+      "category": "optimizer",
+      "edits": {"ADAM_BETAS": "(0.9, 0.95)"},
+      "description": "smooth the AdamW first moment, beta1 0.8 to 0.9, gradients on this data look noisy step to step"
+    },
+    {
+      "id": "opt-warmdown-short",
+      "category": "optimizer",
+      "edits": {"WARMDOWN_RATIO": "0.3"},
+      "description": "spend less of the run decaying, cut the cooldown fraction to 0.3 so the model holds a high learning rate for longer"
+    },
+    {
+      "id": "arch-head-dim-64",
+      "category": "architecture",
+      "edits": {"HEAD_DIM": "64"},
+      "description": "halve the attention head dimension to 64, doubling head count at the same model width for finer-grained mixing"
+    },
+    {
+      "id": "reg-wd-off",
+      "category": "regularization",
+      "edits": {"WEIGHT_DECAY": "0.0"},
+      "description": "remove the decay term entirely as a clean control, if it is worthless the simpler code wins on the simplicity criterion"
+    },
+    {
+      "id": "opt-unembedding-lr-up",
+      "category": "optimizer",
+      "edits": {"UNEMBEDDING_LR": "0.006"},
+      "description": "let the output head move faster, unembedding lr 0.004 to 0.006, since bits per byte is dominated by the final projection"
+    },
+    {
+      "id": "arch-depth-6",
+      "category": "architecture",
+      "edits": {"DEPTH": "6"},
+      "description": "go shallower instead, 6 layers, buying a lot more optimizer steps inside the same five minutes"
+    },
+    {
+      "id": "opt-total-batch-small",
+      "category": "optimizer",
+      "edits": {"TOTAL_BATCH_SIZE": "2 ** 18"},
+      "description": "halve the tokens per optimizer step to 256K, doubling the number of updates the schedule gets to make"
+    },
+    {
+      "id": "reg-wd-mid-high",
+      "category": "regularization",
+      "edits": {"WEIGHT_DECAY": "0.3"},
+      "description": "settle the decay question with a middling penalty of 0.3 between the two extremes already tried"
+    },
+    {
+      "id": "arch-window-sparse",
+      "category": "architecture",
+      "edits": {"WINDOW_PATTERN": "\"SSSSL\""},
+      "description": "lengthen the banded pattern so only every fifth block sees full context, cheaper attention should buy more steps"
+    },
+    {
+      "id": "opt-final-lr-floor",
+      "category": "optimizer",
+      "edits": {"FINAL_LR_FRAC": "0.1"},
+      "description": "stop annealing all the way to zero, hold a floor at 10 percent of peak so the last stretch still learns something"
+    },
+    {
+      "id": "opt-scalar-lr-down",
+      "category": "optimizer",
+      "edits": {"SCALAR_LR": "0.25"},
+      "description": "halve the scalar and gate learning rate to 0.25, those parameters are few and were probably overshooting"
+    },
+    {
+      "id": "arch-aspect-narrow",
+      "category": "architecture",
+      "edits": {"ASPECT_RATIO": "48"},
+      "description": "try the narrow direction, aspect ratio down to 48, a thinner residual stream at the same depth"
+    },
+    {
+      "id": "reg-wd-quarter",
+      "category": "regularization",
+      "edits": {"WEIGHT_DECAY": "0.1"},
+      "description": "one more decay setting at 0.1 to map the curve properly rather than guessing between two sampled points"
+    },
+    {
+      "id": "opt-betas-longer-beta2",
+      "category": "optimizer",
+      "edits": {"ADAM_BETAS": "(0.8, 0.99)"},
+      "description": "lengthen the AdamW second moment window, beta2 0.95 to 0.99, for a steadier per-parameter step size"
+    },
+    {
+      "id": "arch-depth-12",
+      "category": "architecture",
+      "edits": {"DEPTH": "12"},
+      "description": "push depth to 12 layers and find out where the capacity-versus-steps trade actually turns over"
+    },
+    {
+      "id": "opt-total-batch-large",
+      "category": "optimizer",
+      "edits": {"TOTAL_BATCH_SIZE": "2 ** 20"},
+      "description": "the other direction on batch, 1M tokens per step, fewer but much less noisy updates"
+    },
+    {
+      "id": "opt-warmup-long",
+      "category": "optimizer",
+      "edits": {"WARMUP_RATIO": "0.05"},
+      "description": "extend warmup to 5 percent of the run in case the short version was still too abrupt for the deeper model"
+    }
+  ]
+}

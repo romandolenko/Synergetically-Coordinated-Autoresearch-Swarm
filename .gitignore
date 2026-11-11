@@ -28,3 +28,8 @@ sim_runs/
 
 # SCAS live loop wrapper state/traces
 .scas_loop/
+
+# vast.ai tooling (local secrets + fetched run artifacts)
+tools/vast/.env.vast
+tools/vast/.state.json
+vast_runs/

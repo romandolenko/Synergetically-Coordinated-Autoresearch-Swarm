@@ -66,7 +66,7 @@ def test_rule3_prepare_hash_must_match_baseline(h):
 
 @pytest.mark.parametrize(
     "v",
-    [0.0, -1.0, 0.49, None],
+    [0.0, -1.0, 0.09, None],
 )
 def test_rule4_val_bpb_below_floor_rejected(v):
     c = good_commit()
@@ -82,3 +82,32 @@ def test_rule4_val_bpb_below_floor_rejected(v):
 def test_rule5_crash_budget_exceeded(n):
     ok, reason = validate(good_commit(), recent_failures=n)
     assert not ok and reason
+
+
+@pytest.mark.parametrize(
+    "v,ref,ok_expected",
+    [
+        (0.464, 0.577, True),    # the real vast.ai sweep: honest 20% gain accepted
+        (0.28, 0.577, False),    # > 2x better than anything accepted: implausible
+        (0.24, 0.464, True),
+        (0.23, 0.464, False),
+        (0.15, None, True),      # no reference yet: only the absolute backstop
+        (0.15, float("inf"), True),
+    ],
+)
+def test_rule4_floor_is_relative_to_best_accepted(v, ref, ok_expected):
+    c = good_commit()
+    c["val_bpb"] = v
+    ok, reason = validate(c, reference_best=ref)
+    assert ok is ok_expected
+    assert ok or reason
+
+
+def test_file_hash_ignores_line_endings(tmp_path):
+    from scas.coordinator import _file_sha256
+
+    lf = tmp_path / "lf.txt"
+    crlf = tmp_path / "crlf.txt"
+    lf.write_bytes(b"a = 1\nb = 2\n")
+    crlf.write_bytes(b"a = 1\r\nb = 2\r\n")
+    assert _file_sha256(lf) == _file_sha256(crlf)

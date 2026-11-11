@@ -238,3 +238,82 @@ def test_http_round_trip():
     finally:
         server.shutdown()
         t.join(timeout=5)
+
+
+# ------------------------------------------- real-data regressions (2026-11-11)
+
+
+def test_discarded_experiment_never_becomes_target():
+    """A discard on top of a strong incumbent has a better absolute val_bpb
+    than an earlier keep; it must still not become the group's target."""
+    svc = _service(agents=["a0"], n_groups=1)
+    svc.step(_report("a0", "baseline", 0.577, status="keep"))
+    _, r1 = svc.step(_report("a0", "halve tokens per step", 0.480, status="keep"))
+    assert r1["improved_group_best"]
+    assert r1["delta_vs_incumbent"] == pytest.approx(0.480 - 0.577)
+    _, r2 = svc.step(_report("a0", "beta2 to 0.99", 0.470, status="discard",
+                             incumbent_val_bpb=0.464))
+    assert r2["accepted"] and not r2["improved_group_best"]
+    assert r2["target_card_text"] == "halve tokens per step"
+
+
+def test_target_is_biggest_improvement_not_lowest_absolute():
+    svc = _service(agents=["a0"], n_groups=1)
+    svc.step(_report("a0", "baseline", 0.577, status="keep"))
+    svc.step(_report("a0", "big win", 0.500, status="keep"))          # -0.077
+    _, r = svc.step(_report("a0", "small win on top", 0.495, status="keep"))  # -0.005
+    assert r["target_card_text"] == "big win"
+    assert svc.snapshot()["group_best_val_bpb"]["0"] == pytest.approx(0.500)
+
+
+def test_min_improvement_filters_noise_level_keeps():
+    svc = _service(agents=["a0"], n_groups=1, min_improvement=0.002)
+    svc.step(_report("a0", "baseline", 0.5000, status="keep"))
+    _, r = svc.step(_report("a0", "within noise", 0.4993, status="keep"))
+    assert not r["improved_group_best"]
+    _, r = svc.step(_report("a0", "real gain", 0.4900, status="keep"))
+    assert r["improved_group_best"]
+
+
+def test_floor_is_relative_to_best_accepted():
+    svc = _service(agents=["a0"], n_groups=1)
+    _, r = svc.step(_report("a0", "baseline", 0.577))
+    assert r["accepted"]
+    _, r = svc.step(_report("a0", "honest gain below the old 0.5 floor", 0.464))
+    assert r["accepted"]
+    _, r = svc.step(_report("a0", "fraudulent", 0.20))
+    assert not r["accepted"] and "floor" in r["reject_reason"]
+
+
+def test_state_file_round_trip(tmp_path):
+    path = tmp_path / "state.json"
+    svc = _service(state_file=str(path))
+    svc.step(_report("a0", "muon on the hidden weights", 0.99))
+    svc.step(_report("a1", "wider FFN at 6x", 0.98))
+    _, last = svc.step(_report("a0", "muon with nesterov", 0.97))
+    before = svc.snapshot()
+
+    svc2 = _service(state_file=str(path))
+    assert svc2.snapshot() == before
+    # the restarted service carries on from the same incumbents and targets
+    _, r = svc2.step(_report("a0", "a worse attempt", 0.98, status="discard"))
+    assert r["target_card_text"] == last["target_card_text"]
+    assert r["incumbent_val_bpb"] == pytest.approx(0.97)
+
+
+def test_token_required_when_configured():
+    svc = _service()
+    server = make_server(svc, "127.0.0.1", 0, token="s3cret")
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        url = "http://127.0.0.1:%d" % server.server_address[1]
+        assert requests.get(url + "/health", timeout=10).status_code == 200
+        assert requests.post(url + "/step", json=_report(), timeout=10).status_code == 401
+        assert requests.get(url + "/state", timeout=10).status_code == 401
+        ok = requests.post(url + "/step", json=_report(), timeout=10,
+                           headers={"Authorization": "Bearer s3cret"})
+        assert ok.status_code == 200 and ok.json()["accepted"]
+    finally:
+        server.shutdown()
+        server.server_close()

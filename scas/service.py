@@ -43,11 +43,14 @@ Run:
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import os
 import threading
 import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from scas.coordinator import (
     BASELINE_PREPARE_HASH,
@@ -87,6 +90,8 @@ class CoordinatorService:
         avoid_k: int = 8,
         strict_envelope: bool = False,
         embedder=None,
+        min_improvement: float = 0.0,
+        state_file: str | None = None,
     ):
         if embedder is None:
             from scas.embedder import Embedder
@@ -121,6 +126,93 @@ class CoordinatorService:
             a: deque(maxlen=CRASH_WINDOW) for a in agents
         }
         self._last_step: dict[str, int] = {}
+        # Credit assignment (real-data finding, vast.ai sweep 2026-11-11): an
+        # agent's val_bpb reflects everything stacked on its branch, so ranking
+        # cards by absolute val_bpb made discarded experiments the group target.
+        # Cards are ranked by improvement over the agent's own incumbent (its
+        # best kept val_bpb), and only kept experiments may lead a group.
+        self.min_improvement = float(min_improvement)
+        self._incumbent: dict[str, float] = {}
+        self._group_best_abs: dict[int, float] = {}
+        # Best val_bpb accepted from any agent: the relative plausibility floor.
+        self._best_accepted: float | None = None
+        self.state_file = Path(state_file) if state_file else None
+        if self.state_file is not None and self.state_file.exists():
+            self._load(json.loads(self.state_file.read_text(encoding="utf-8")))
+
+    # ------------------------------------------------------------- persistence
+
+    def dump(self) -> dict:
+        """Full restartable state (JSON-safe)."""
+        st = self.coord.state
+
+        def vecs(d):
+            return {str(g): [float(x) for x in v] for g, v in d.items()}
+
+        return {
+            "version": 1,
+            "mode": self.mode,
+            "n_groups": self.n_groups,
+            "agent_to_group": dict(self.coord.agent_to_group),
+            "groups": {str(g): list(m) for g, m in st.groups.items()},
+            "attractors": vecs(st.attractors),
+            "best_emb": vecs(self.coord._best_emb),
+            "group_best_score": {
+                str(g): (None if v == float("inf") else v)
+                for g, v in st.group_best_val_bpb.items()
+            },
+            "psi": dict(st.psi),
+            "alpha": dict(st.alpha),
+            "group_best_text": {str(g): t for g, t in self._group_best_text.items()},
+            "group_best_abs": {str(g): v for g, v in self._group_best_abs.items()},
+            "group_recent": {str(g): list(d) for g, d in self._group_recent.items()},
+            "status_history": {a: list(d) for a, d in self._status_history.items()},
+            "last_step": dict(self._last_step),
+            "incumbent": dict(self._incumbent),
+            "best_accepted": self._best_accepted,
+        }
+
+    def _load(self, d: dict) -> None:
+        import numpy as np
+
+        if d.get("mode") != self.mode or d.get("n_groups") != self.n_groups:
+            raise ValueError(
+                "state file was written by a %s/%s-group service; this one is %s/%s"
+                % (d.get("mode"), d.get("n_groups"), self.mode, self.n_groups)
+            )
+        st = self.coord.state
+        self.coord.agent_to_group = dict(d["agent_to_group"])
+        st.groups = {int(g): list(m) for g, m in d["groups"].items()}
+        st.attractors = {
+            int(g): np.asarray(v, dtype=np.float32) for g, v in d["attractors"].items()
+        }
+        self.coord._best_emb = {
+            int(g): np.asarray(v, dtype=np.float32) for g, v in d["best_emb"].items()
+        }
+        st.group_best_val_bpb = {
+            int(g): (float("inf") if v is None else float(v))
+            for g, v in d["group_best_score"].items()
+        }
+        st.psi = dict(d["psi"])
+        st.alpha = dict(d["alpha"])
+        self._group_best_text = {int(g): t for g, t in d["group_best_text"].items()}
+        self._group_best_abs = {int(g): v for g, v in d["group_best_abs"].items()}
+        for g, items in d["group_recent"].items():
+            self._group_recent[int(g)] = deque(items, maxlen=4 * self.avoid_k)
+        self._status_history = {
+            a: deque(items, maxlen=CRASH_WINDOW)
+            for a, items in d["status_history"].items()
+        }
+        self._last_step = dict(d["last_step"])
+        self._incumbent = dict(d["incumbent"])
+        self._best_accepted = d.get("best_accepted")
+
+    def _persist(self) -> None:
+        if self.state_file is None:
+            return
+        tmp = self.state_file.with_name(self.state_file.name + ".tmp")
+        tmp.write_text(json.dumps(self.dump()), encoding="utf-8")
+        tmp.replace(self.state_file)
 
     # ------------------------------------------------------------- registration
 
@@ -176,10 +268,32 @@ class CoordinatorService:
         recent_failures = sum(
             1 for s in self._status_history[agent_id] if s == "crash"
         )
-        accepted, reject_reason = validate(commit, recent_failures)
+        accepted, reject_reason = validate(
+            commit, recent_failures, reference_best=self._best_accepted
+        )
 
         self._status_history[agent_id].append(status)
         self._last_step[agent_id] = step
+
+        # Improvement over the agent's own incumbent. The agent may state the
+        # incumbent explicitly (joining mid-run, or after a service restart);
+        # otherwise it is the best val_bpb this agent has kept so far.
+        incumbent = report.get("incumbent_val_bpb")
+        if incumbent is not None:
+            try:
+                incumbent = float(incumbent)
+            except (TypeError, ValueError):
+                return 400, {"error": "incumbent_val_bpb must be a number"}
+        else:
+            incumbent = self._incumbent.get(agent_id)
+            if incumbent is None:
+                # an agent with no history of its own is measured against the
+                # best result the swarm has accepted so far
+                incumbent = self._best_accepted
+        delta = 0.0 if incumbent is None else val_bpb - incumbent
+        can_lead = status == "keep" and (
+            incumbent is None or delta < -self.min_improvement
+        )
 
         improved = False
         if accepted:
@@ -194,11 +308,20 @@ class CoordinatorService:
                 category=g_cat if g_cat is not None else "emergent",
                 parent_step=report.get("parent_step"),
             )
-            improved = self.coord.observe(card, val_bpb, embedding, accepted=True)
+            improved = self.coord.observe(
+                card, delta, embedding, accepted=True, can_lead=can_lead
+            )
             g = self.coord.agent_to_group[agent_id]
             if improved:
                 self._group_best_text[g] = summary
+                self._group_best_abs[g] = val_bpb
             self._group_recent[g].append(summary)
+            if status == "keep":
+                prev = self._incumbent.get(agent_id)
+                self._incumbent[agent_id] = val_bpb if prev is None else min(prev, val_bpb)
+            if self._best_accepted is None or val_bpb < self._best_accepted:
+                self._best_accepted = val_bpb
+        self._persist()
 
         return 200, {
             "agent_id": agent_id,
@@ -207,6 +330,8 @@ class CoordinatorService:
             "reject_reason": reject_reason,
             **self._guidance(agent_id),
             "improved_group_best": improved,
+            "delta_vs_incumbent": delta if accepted else None,
+            "incumbent_val_bpb": self._incumbent.get(agent_id),
         }
 
     def _guidance(self, agent_id: str) -> dict:
@@ -243,10 +368,18 @@ class CoordinatorService:
             "group_to_category": {
                 str(g): c for g, c in self.coord.group_to_category.items()
             },
+            # absolute val_bpb of each group's target card ...
             "group_best_val_bpb": {
+                str(g): self._group_best_abs.get(g) for g in st.group_best_val_bpb
+            },
+            # ... and the score it is ranked by: improvement over its agent's incumbent
+            "group_best_delta": {
                 str(g): (None if v == float("inf") else v)
                 for g, v in st.group_best_val_bpb.items()
             },
+            "incumbent_val_bpb": dict(self._incumbent),
+            "best_accepted_val_bpb": self._best_accepted,
+            "min_improvement": self.min_improvement,
             "group_best_text": {str(g): t for g, t in self._group_best_text.items()},
             "psi": dict(st.psi),
             "alpha": dict(st.alpha),
@@ -262,10 +395,23 @@ class CoordinatorService:
 # ------------------------------------------------------------------ HTTP layer
 
 
-def make_server(service: CoordinatorService, host: str, port: int) -> ThreadingHTTPServer:
+def make_server(
+    service: CoordinatorService, host: str, port: int, token: str | None = None
+) -> ThreadingHTTPServer:
+    """``token`` (if set) is required as ``Authorization: Bearer <token>`` on
+    everything except ``/health``."""
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
+        def _authorized(self) -> bool:
+            if not token:
+                return True
+            got = self.headers.get("Authorization", "")
+            if hmac.compare_digest(got.encode(), ("Bearer " + token).encode()):
+                return True
+            self._send(401, {"error": "missing or wrong bearer token"})
+            return False
+
         def _send(self, code: int, payload: dict) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(code)
@@ -295,6 +441,8 @@ def make_server(service: CoordinatorService, host: str, port: int) -> ThreadingH
                     n = len(service.coord.agent_to_group)
                 self._send(200, {"ok": True, "mode": service.mode, "n_agents": n})
             elif self.path == "/state":
+                if not self._authorized():
+                    return
                 with lock:
                     snap = service.snapshot()
                 self._send(200, snap)
@@ -307,6 +455,8 @@ def make_server(service: CoordinatorService, host: str, port: int) -> ThreadingH
         def _post(self) -> None:
             if self.path != "/step":
                 self._send(404, {"error": f"unknown path {self.path}"})
+                return
+            if not self._authorized():
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -354,7 +504,26 @@ def main() -> None:
         help="reject reports that omit pyproject/prepare hashes instead of "
              "trusting the local baseline",
     )
+    p.add_argument(
+        "--min-improvement", type=float, default=0.0, dest="min_improvement",
+        help="a kept experiment must beat its agent's incumbent by more than "
+             "this to become a group target (set to the measured run-to-run "
+             "noise of val_bpb)",
+    )
+    p.add_argument(
+        "--state-file", default=None, dest="state_file",
+        help="persist coordinator state here after every report and reload it "
+             "on start, so a restart does not lose the swarm's history",
+    )
+    p.add_argument(
+        "--token", default=os.environ.get("SCAS_TOKEN"),
+        help="shared secret required as a Bearer token (default: $SCAS_TOKEN). "
+             "Mandatory when --host is not loopback",
+    )
     args = p.parse_args()
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
+        p.error("--host %s exposes the coordinator beyond this machine; set "
+                "--token or $SCAS_TOKEN" % args.host)
 
     agents = [a.strip() for a in args.agents.split(",") if a.strip()]
     categories = (
@@ -371,10 +540,14 @@ def main() -> None:
         alpha_temp=args.alpha_temp,
         avoid_k=args.avoid_k,
         strict_envelope=args.strict_envelope,
+        min_improvement=args.min_improvement,
+        state_file=args.state_file,
     )
-    server = make_server(service, args.host, args.port)
+    server = make_server(service, args.host, args.port, token=args.token)
     print(json.dumps({
         "listening": f"http://{args.host}:{server.server_address[1]}",
+        "auth": "bearer token" if args.token else "none (loopback only)",
+        "state_file": args.state_file,
         "mode": service.mode,
         "agents": agents,
         "endpoints": ["POST /step", "GET /state", "GET /health"],

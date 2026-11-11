@@ -126,7 +126,7 @@ def test_read_last_tsv_row(tmp_path):
     )
     row = read_last_tsv_row(tsv)
     assert row == {"summary": "double width (OOM)", "val_bpb": 0.0,
-                   "status": "crash"}
+                   "status": "crash", "incumbent": 0.9979}
     empty = tmp_path / "empty.tsv"
     empty.write_text("commit\tval_bpb\tmemory_gb\tstatus\tdescription\n")
     with pytest.raises(ValueError):
@@ -158,3 +158,15 @@ def test_analyze_trace_scores_compliance(tmp_path):
     assert out["refine"]["mean_margin"] > 0
     assert out["explore"]["compliance"] == 1.0 and out["explore"]["mean_margin"] < 0
     assert out["refine_minus_explore_margin"] > 0
+
+
+def test_router_is_anchored_and_admits_unknown():
+    from scas.replay import UNKNOWN, route
+
+    # real cards from the vast.ai sweep (2026-11-11)
+    assert route("one more decay setting at 0.1 to map the curve properly")[0] == UNKNOWN
+    assert route("back the decay penalty right off to 0.05")[0] == UNKNOWN
+    assert route("add rotary positional embeddings (RoPE)")[0] == "architecture"
+    assert route("increase LR to 0.04") == ("optimizer", "lr ")
+    assert route("tie input and output embeddings")[0] == "architecture"
+    assert route("baseline") == (UNKNOWN, None)

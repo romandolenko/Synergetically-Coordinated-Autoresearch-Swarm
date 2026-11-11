@@ -14,13 +14,25 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """sha256 of the file with line endings normalised to LF.
+
+    A Windows checkout (core.autocrlf) holds CRLF copies of the same blobs a
+    Linux box holds as LF; hashing raw bytes made the envelope reject every
+    cross-platform report as "hash drifted".
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 BASELINE_PYPROJECT_HASH: str = _file_sha256(_REPO_ROOT / "pyproject.toml")
 BASELINE_PREPARE_HASH: str = _file_sha256(_REPO_ROOT / "prepare.py")
 
-MIN_PLAUSIBLE_VAL_BPB: float = 0.5
+# Plausibility floor. The absolute value is only a dataset-agnostic backstop
+# (it was 0.5, calibrated on climbmix ~1.0; a real TinyStories sweep legitimately
+# reached 0.464 and had 8/26 honest rows rejected). The working check is
+# relative: a report may not claim less than MIN_PLAUSIBLE_FRACTION of the best
+# value the swarm has already accepted.
+MIN_PLAUSIBLE_VAL_BPB: float = 0.1
+MIN_PLAUSIBLE_FRACTION: float = 0.5
 MAX_FAILURES_IN_LAST_5: int = 2
 
 # Control-law defaults (design §5). Tuned values from results-day3.md §13:
@@ -61,8 +73,22 @@ class CoordinatorState:
     alpha: dict[str, float] = field(default_factory=dict)
 
 
-def validate(commit: dict, recent_failures: int = 0) -> tuple[bool, str | None]:
+def plausibility_floor(reference_best: float | None = None) -> float:
+    """Lowest believable val_bpb given the best accepted value so far."""
+    if reference_best is None or not math.isfinite(reference_best):
+        return MIN_PLAUSIBLE_VAL_BPB
+    return max(MIN_PLAUSIBLE_VAL_BPB, MIN_PLAUSIBLE_FRACTION * float(reference_best))
+
+
+def validate(
+    commit: dict,
+    recent_failures: int = 0,
+    reference_best: float | None = None,
+) -> tuple[bool, str | None]:
     """Apply the invariant-manifold safety envelope (design §8).
+
+    ``reference_best`` is the best val_bpb already accepted (any agent); when
+    given, the plausibility floor is relative to it instead of a constant.
 
     Returns (ok, reason). On reject, `reason` is a short non-empty string.
     """
@@ -75,8 +101,9 @@ def validate(commit: dict, recent_failures: int = 0) -> tuple[bool, str | None]:
     if commit.get("prepare_hash") != BASELINE_PREPARE_HASH:
         return False, "prepare.py hash drifted from baseline"
     val_bpb = commit.get("val_bpb")
-    if val_bpb is None or val_bpb < MIN_PLAUSIBLE_VAL_BPB:
-        return False, f"val_bpb {val_bpb} below MIN_PLAUSIBLE_VAL_BPB={MIN_PLAUSIBLE_VAL_BPB}"
+    floor = plausibility_floor(reference_best)
+    if val_bpb is None or val_bpb < floor:
+        return False, f"val_bpb {val_bpb} below plausibility floor {floor:.4f}"
     if recent_failures > MAX_FAILURES_IN_LAST_5:
         return False, f"crash budget exceeded: {recent_failures} failures in last 5"
     return True, None
@@ -258,23 +285,29 @@ class SCTCoordinator:
         val_bpb: float,
         embedding: np.ndarray,
         accepted: bool,
+        can_lead: bool = True,
     ) -> bool:
         """Integrate one step of the attractor and psi relaxations for this agent.
+
+        ``val_bpb`` is the ranking score (lower is better). The live service
+        passes the improvement over the agent's own incumbent rather than the
+        absolute value, and ``can_lead=False`` for experiments the agent did
+        not keep, so a discarded idea can never become the group's target.
 
         Returns True if this observation improved the group best.
         """
         if not accepted:
             return False
         g = self.agent_to_group[card.agent_id]
-        return self._integrate(card.agent_id, g, val_bpb, embedding)
+        return self._integrate(card.agent_id, g, val_bpb, embedding, can_lead)
 
     def _integrate(
-        self, agent_id: str, g: int, val_bpb: float, embedding: np.ndarray
+        self, agent_id: str, g: int, val_bpb: float, embedding: np.ndarray,
+        can_lead: bool = True,
     ) -> bool:
         """The shared relaxation dynamics, given a group assignment ``g``."""
-        improved = (
-            g not in self.state.attractors
-            or val_bpb < self.state.group_best_val_bpb[g]
+        improved = g not in self.state.attractors or (
+            can_lead and val_bpb < self.state.group_best_val_bpb[g]
         )
         if improved:
             self.state.group_best_val_bpb[g] = float(val_bpb)
@@ -358,6 +391,7 @@ class EmergentSCTCoordinator(SCTCoordinator):
         val_bpb: float,
         embedding: np.ndarray,
         accepted: bool,
+        can_lead: bool = True,
     ) -> bool:
         if not accepted:
             return False
@@ -378,4 +412,4 @@ class EmergentSCTCoordinator(SCTCoordinator):
                 self.state.groups[prev].remove(aid)
             self.state.groups[g].append(aid)
             self.agent_to_group[aid] = g
-        return self._integrate(aid, g, val_bpb, embedding)
+        return self._integrate(aid, g, val_bpb, embedding, can_lead)
