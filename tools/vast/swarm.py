@@ -323,6 +323,8 @@ def propose(workdir: Path, prompt: str, model: str, timeout: int = 900) -> dict:
     out["turns"] = data.get("num_turns")
     if data.get("is_error"):
         out["error"] = "agent error: %s" % text[:300]
+        # a usage limit will not clear in time: stop instead of idling paid GPUs
+        out["fatal"] = "limit" in text.lower() and "reset" in text.lower()
         return out
     m = re.findall(r"^\s*DESCRIPTION:\s*(.+?)\s*$", text, re.MULTILINE)
     if m:
@@ -527,6 +529,9 @@ def run_agent(ctx: ArmContext, agent: str, box, workroot: Path, deadline: float,
         if stray:
             git(wd, "clean", "-fdq")
         err = prop.get("error")
+        if prop.get("fatal"):
+            log("%s: agent usage limit reached - agent stops (%s)" % (tagp, err))
+            return
         if not err and not git(wd, "diff", "--stat").strip():
             err = "agent made no change to train.py"
         if not err:
@@ -687,6 +692,10 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
                        for ln in git(wd, "status", "--porcelain").strip().splitlines()):
                     git(wd, "clean", "-fdq")
                 err = prop.get("error")
+                if prop.get("fatal"):
+                    hub.release(directive)
+                    log("%s: agent usage limit reached - agent stops (%s)" % (tagp, err))
+                    return
                 if not err and not git(wd, "diff", "HEAD").strip():
                     err = "agent made no change to train.py"
                 if not err:
@@ -727,9 +736,29 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
         t_train = time.time()
         res = train(n)
         out = hub.report(claim, res.get("val_bpb"), tp.read_text(encoding="utf-8"))
+        adopted = False
         if out["status"] == "keep" and not out["promoted"]:
             desc = description[7:] if description.startswith("merge: ") else description
-            pending = {"diff": diff, "description": desc, "gain_pct": out["gain_pct"]}
+            if directive["kind"] in ("merge", "combine"):
+                # kept on two bases already: if it still applies cleanly to the
+                # current head, promote it without a third run
+                head2, code2, _ = hub.head_state()
+                git(wd, "reset", "-q", "--hard", "HEAD")
+                tp.write_text(code2, encoding="utf-8", newline="\n")
+                if git(wd, "status", "--porcelain").strip():
+                    git(wd, "commit", "-q", "-am", "sync before adopt")
+                pfile = adir / "pending.diff"
+                pfile.write_text(diff, encoding="utf-8", newline="\n")
+                try:
+                    git(wd, "apply", "--3way", str(pfile))
+                    if git(wd, "diff", "HEAD").strip() and not syntax_error(tp):
+                        adopted = hub.adopt(out, head2, tp.read_text(encoding="utf-8"),
+                                            description)
+                except RuntimeError:
+                    pass
+            if not adopted:
+                pending = {"diff": diff, "description": desc, "gain_pct": out["gain_pct"]}
+            out["adopted"] = adopted
         row = base_row(n, description, res, t_start, t_train)
         row.update(status=out["status"], kind=directive["kind"], best_before=out["ref"],
                    version=head, propose_secs=prop.get("secs"), cost_usd=prop.get("cost_usd"),
@@ -739,7 +768,8 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
         record(row)
         log("%s #%d %-10s %-7s %+.2f%% %s(shared v%d, %.1f min into arm)  %s" % (
             tagp, n, directive["kind"], out["status"], out["gain_pct"],
-            "PROMOTED " if out["promoted"] else ("re-test queued " if pending else ""),
+            "PROMOTED " if out["promoted"] else (
+                "ADOPTED " if adopted else ("re-test queued " if pending else "")),
             out["head_index"], (time.time() - t_arm) / 60.0, description[:60]))
 
 

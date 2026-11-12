@@ -149,6 +149,54 @@ agent is the natural next step and touches only the plan-loading half of `sweep.
 
 ---
 
+## Hardware
+
+Measured on the unmodified `train.py` (one baseline run per card, 2026-11-12):
+
+| GPU | $/hr | tokens/sec | steps in 5 min | baseline val_bpb | seconds per run | cost per run |
+| --- | --- | --- | --- | --- | --- | --- |
+| RTX 4090 | 0.42 | 170k | 108 | 0.576 | ~400 | $0.047 |
+| RTX 4080 Super | 0.19 | 93k | 64 | 0.696 | 455 | $0.024 |
+| RTX 3090 | 0.21 | 71k | 52 | 1.011 | 486 | $0.028 |
+
+- **RTX 4080 Super** gives about twice the experiments per dollar and 22% more tokens per
+  dollar than a 4090. Use it (`--gpu RTX_4080S`) when arms are compared against each
+  other on the same hardware. Its baseline is more step-starved, so "more optimizer
+  steps" changes pay even more than on a 4090.
+- **RTX 4090** stays the default: every result so far was measured on it, and val_bpb is
+  not comparable across GPU models.
+- **RTX 3090** is slower and no cheaper than the 4080 Super. Do not use it.
+- **CPU cores do not matter** above the 8-core floor: an 8-core box matched 64-128-core
+  boxes at 170k tokens/sec.
+- **VRAM is not the limit.** Peak use was 6-13 GB on a 4090 and 3 GB on the 4080 Super
+  (its tier turns activation checkpointing on).
+- **Same-model boxes differ.** RTX 4090s ranged 162k-171k tokens/sec, moving the baseline
+  from 0.574 to 0.587. `swarm.py up` reads the smoke-test throughput and rejects a 4090
+  below 168k (`--min-tok-sec`).
+- About a quarter of rented time is not training: roughly 90 s of startup and evaluation
+  per 5-minute run.
+
+---
+
+## The swarm comparison
+
+`swarm.py` runs live agents (headless `claude -p` sessions) in up to five arms:
+`scas` (v1 coordinator packets), `scas2` (the v2 coordinator in `scas/v2.py`: one shared
+`train.py`, duplicate check, discounted refine targets, bandit over directive kinds),
+`independent`, `hub` (shared tried-list) and `single` (one agent, K times the time).
+
+```powershell
+uv run python tools/vast/swarm.py up --boxes 3
+uv run python tools/vast/swarm.py run --arms scas2,hub --hours 2     # destroys the boxes at the end
+uv run python tools/vast/swarm_analyze.py vast_runs/swarm-<stamp>
+uv run python tools/vast/swarm.py run --fake --arms scas2 --hours 0.2   # stub trainer, no GPU
+```
+
+The machine running it must stay awake, and the agents draw on the Claude subscription;
+if its usage limit is hit the agents stop and the run ends.
+
+---
+
 ## Extending to S2 / S3
 
 The review's next two experiments reuse this harness:

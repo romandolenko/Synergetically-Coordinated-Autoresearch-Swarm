@@ -201,13 +201,15 @@ def scas2_section(arm: dict) -> list[str]:
                 sum((r.get("coordinator") or {}).get("gain_pct", 0.0) for r in kept)))
     lines.append("")
     promoted = sum(1 for r in exps if (r.get("coordinator") or {}).get("promoted"))
+    adopted = sum(1 for r in exps if (r.get("coordinator") or {}).get("adopted"))
     requeued = sum(1 for r in exps if r["status"] == "keep"
-                   and not (r.get("coordinator") or {}).get("promoted"))
+                   and not (r.get("coordinator") or {}).get("promoted")) - adopted
     ver = [r for r in rows if r.get("kind") == "verify"]
     failed = [r for r in ver if r["status"] == "verify_fail"]
     rolled = sum(1 for r in ver if (r.get("coordinator") or {}).get("action") == "rolled_back")
     lines.append("- kept experiments promoted to the shared version: %d; kept on an "
-                 "outdated version and queued for a re-test: %d" % (promoted, requeued))
+                 "outdated version and queued for a re-test: %d; adopted after a second "
+                 "keep without a third run: %d" % (promoted, requeued, adopted))
     lines.append("- re-measurement runs: %d (%d disagreed, %d rollbacks)"
                  % (len(ver), len(failed), rolled))
     ev = arm["dir"] / "v2_events.jsonl"

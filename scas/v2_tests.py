@@ -258,3 +258,26 @@ def test_history_and_snapshot_are_serialisable():
     snap = h.snapshot()
     json.dumps(snap)
     assert len(snap["chain"]) == 2 and snap["by_kind"]["tune"]["kept"] == 1
+
+
+def test_adopt_promotes_a_twice_kept_change_without_a_third_run():
+    h = hub()
+    old = h.head
+    run(h, "a0", "b0", ("A = 1", "A = 9"), 0.90, "Raised A")
+    out = run(h, "a1", "b1", ("B = 2", "B = 7"), 1.0, "Raised B", base=old)
+    assert not out["promoted"]
+    head = h.head
+    assert h.adopt(out, head, "A = 9\nB = 7\n", "Raised B")
+    assert h.head_state()[1] == "A = 9\nB = 7\n"
+    # nobody measured the adopted version: every box sees an estimate
+    assert h.reference("b0")[1] == 1 and h.reference("b1")[1] == 2
+    assert h.reference("b0")[0] == pytest.approx(0.90 * (1 - out["gain_pct"] / 100))
+    # a stale expectation is refused
+    assert not h.adopt(out, head, "A = 9\nB = 8\n", "Raised B")
+
+
+def test_merge_results_are_not_refine_targets():
+    h = hub(seed=3)
+    run(h, "a0", "b0", ("A = 1", "A = 9"), 0.90, "merge: Raised A", kind="merge")
+    assert h.next_directive("a0")["kind"] != "refine"
+    h.bandit["tune"]["pending"] = 0

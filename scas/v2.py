@@ -243,7 +243,9 @@ class SwarmV2:
 
     def next_directive(self, agent: str) -> dict:
         with self.lock:
-            targets = [e for e in self.archive if e["status"] == "keep" and e["gain_pct"] > 0]
+            targets = [e for e in self.archive
+                       if e["status"] == "keep" and e["gain_pct"] > 0
+                       and e["kind"] not in ("merge", "combine")]
             arms = [k for k in KINDS if k != "refine" or targets]
             total = sum(self.bandit[k]["n"] + self.bandit[k]["pending"] for k in arms)
             best, best_score = None, -1.0
@@ -366,11 +368,39 @@ class SwarmV2:
                 except Exception:  # noqa: BLE001 - telemetry must not break the run
                     pass
             self.archive.append(e)
-            out.update(status=e["status"], gain_pct=e["gain_pct"], kind=kind,
+            out.update(status=e["status"], gain_pct=e["gain_pct"], kind=kind, box=box,
                        head=self.head, head_index=self.versions[self.head]["index"])
             self._event("report", **{k: v for k, v in e.items() if k != "z"},
                         promoted=out["promoted"], head=self.head)
             return out
+
+    def adopt(self, claim_ref: dict, expected_head: str, new_code: str, card: str) -> bool:
+        """Promote a change that was kept twice (on its own base and again as a
+        merge) but lost the race to the head both times, without a third run.
+
+        In the first dry run a kept change needed two or three re-tests because
+        the head kept moving under it. The new version carries the gain ratio
+        the merge run measured and has no measurement on any box, so every box
+        counts it as an estimated hop and the periodic re-measurement checks it.
+        """
+        with self.lock:
+            if expected_head != self.head:
+                return False
+            h = code_hash(new_code)
+            if h in self.versions:
+                return False
+            ratio = 1.0 - claim_ref["gain_pct"] / 100.0
+            self.codes[h] = new_code
+            self.versions[h] = {"parent": self.head, "ratio": ratio,
+                                "index": self.versions[self.head]["index"] + 1,
+                                "desc": card, "by": claim_ref.get("box")}
+            self.head = h
+            for e in reversed(self.archive):
+                if e["card"] == card and e["status"] == "keep" and not e.get("new_hash"):
+                    e["new_hash"] = h
+                    break
+            self._event("adopted", version=h, card=card, ratio=ratio)
+            return True
 
     # -------------------------------------------------------------- history
 
