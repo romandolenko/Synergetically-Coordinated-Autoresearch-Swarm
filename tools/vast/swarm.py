@@ -52,16 +52,27 @@ REMOTE_LOGS = "/workspace/swarm_logs"
 # (0.00022, sweep of 2026-11-11), rounded up.
 KEEP_MARGIN = 0.0005
 TRAIN_TIMEOUT_S = 720       # program.md: kill anything past ~10 minutes
-POLL_S = 20
+POLL_S = 6                  # was 20: an idle GPU for ~10 s per run, 2.5% of the rental
 CYCLE_RESERVE_S = 9 * 60    # do not start an experiment that cannot finish
-ARMS = ("scas", "independent", "hub", "single")
+ARMS = ("scas", "scas2", "independent", "hub", "single")
+# Smoke-test throughput a box must reach to be used (`up --min-tok-sec` overrides).
+# Measured on the unmodified train.py; see tools/vast/README.md "Hardware".
+MIN_TOK_SEC = {"RTX_4090": 168000}
 
 _print_lock = threading.Lock()
 
 
 def log(msg):
+    # A Windows console is cp1252: an agent description containing an arrow or
+    # a superscript raised UnicodeEncodeError here and killed the agent thread
+    # (run of 2026-11-12 lost two agents this way). Logging must never raise.
+    line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
     with _print_lock:
-        print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or "ascii"
+            print(line.encode(enc, "replace").decode(enc), flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -165,28 +176,62 @@ class Box:
 
 
 class FakeBox:
-    """Stub trainer for --fake: no GPU, a few seconds per run."""
+    """Stub trainer for --fake: no GPU, a few seconds per run. The score is a
+    deterministic function of the code, so merges and re-measurements behave
+    like the real thing: three constants matter a lot, any other edit moves the
+    score by a small amount fixed by its content."""
+
+    BIG = ("TOTAL_BATCH_SIZE", "MATRIX_LR", "DEPTH")
 
     def __init__(self, i: int):
         self.name = "fake%d" % i
         self.st = {"instance_id": "fake%d" % i, "dph_total": 0.0}
         self.rng = random.Random(100 + i)
-        self.level = 0.576
+        self.scale = 1.0 + 0.01 * i          # boxes differ in speed
+        self.pristine = (REPO_ROOT / "train.py").read_text(encoding="utf-8")
 
     def fetch_train_py(self, dest: Path) -> None:
-        dest.write_text((REPO_ROOT / "train.py").read_text(encoding="utf-8"),
-                        encoding="utf-8", newline="\n")
+        dest.write_text(self.pristine, encoding="utf-8", newline="\n")
+
+    @classmethod
+    def _split(cls, code: str):
+        consts, rest = {}, []
+        for ln in code.replace("\r\n", "\n").split("\n"):
+            m = re.match(r"^(%s)\s*=\s*([^#]+)" % "|".join(cls.BIG), ln)
+            if m:
+                try:
+                    consts[m.group(1)] = float(eval(m.group(2), {"__builtins__": {}}))
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                rest.append(ln.rstrip())
+        return consts, "\n".join(rest)
+
+    def score(self, code: str) -> float:
+        import hashlib
+        import math
+
+        c, rest = self._split(code)
+        _, rest0 = self._split(self.pristine)
+        e = round(math.log2(max(c.get("TOTAL_BATCH_SIZE", 2 ** 19), 2.0)))
+        f = {19: 1.0, 18: 0.90, 17: 0.81, 16: 0.79, 15: 0.785}.get(e, 0.83 if e < 15 else 1.05)
+
+        def bump(lr):
+            return math.exp(-((lr - 0.06) / 0.015) ** 2)
+
+        f *= 1.0 - 0.03 * (bump(c.get("MATRIX_LR", 0.04)) - bump(0.04))
+        f *= {8: 1.0, 6: 0.96, 4: 0.99}.get(int(c.get("DEPTH", 8)), 1.05)
+        if rest != rest0:
+            u = int(hashlib.sha256(rest.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+            f *= 1.0 + (u - 0.7) * 0.02
+        return 0.576 * self.scale * f
 
     def train(self, train_py: Path, tag: str) -> dict:
         time.sleep(3)
-        if tag.endswith("_000"):
-            val = self.level
-        else:
-            val = self.level + self.rng.uniform(-0.012, 0.02)
-            if self.rng.random() < 0.1:
-                return {"error": "crash", "exit_code": 1,
-                        "log_tail": "RuntimeError: fake shape mismatch"}
-        self.level = min(self.level, val)
+        if self.rng.random() < 0.03 and not tag.endswith("_000"):
+            return {"error": "crash", "exit_code": 1,
+                    "log_tail": "RuntimeError: fake shape mismatch"}
+        val = self.score(train_py.read_text(encoding="utf-8")) + self.rng.uniform(-0.0002, 0.0002)
         return {"val_bpb": round(val, 6), "peak_vram_mb": 6300.0, "num_steps": 300,
                 "exit_code": 0, "log_tail": "val_bpb: %.6f" % val}
 
@@ -211,7 +256,9 @@ Rules:
 - On this GPU, DEVICE_BATCH_SIZE and EVAL_BATCH_SIZE are overridden by an
   autotuner: editing those two constants changes nothing. Do not spend an
   experiment on them.
-- train.py currently contains every change marked "keep" below. Changes marked
+"""
+
+OWN_BRANCH_NOTE = """- train.py currently contains every change marked "keep" below. Changes marked
   "discard" or "crash" were reverted.
 """
 
@@ -312,7 +359,8 @@ def syntax_error(path: Path) -> str | None:
 class ArmContext:
     """What one arm shares between its agents."""
 
-    def __init__(self, arm: str, agents: list[str], out: Path, seed: int):
+    def __init__(self, arm: str, agents: list[str], out: Path, seed: int,
+                 base_code: str | None = None):
         self.arm = arm
         self.agents = agents
         self.out = out
@@ -321,6 +369,19 @@ class ArmContext:
         self.clients: dict = {}              # scas
         self.server = None
         self.service = None
+        self.hub = None
+        if arm == "scas2":
+            from scas.coordinator import EmergentSCTCoordinator
+            from scas.embedder import Embedder
+            from scas.service import SCT_ALPHA_TEMP, SCT_PSI_0
+            from scas.v2 import SwarmV2
+
+            self.hub = SwarmV2(
+                base_code, Embedder(), margin=KEEP_MARGIN, seed=seed,
+                event_log=out / "v2_events.jsonl",
+                sct=EmergentSCTCoordinator(agents, 3, psi_0=SCT_PSI_0,
+                                           alpha_temp=SCT_ALPHA_TEMP),
+            )
         if arm == "scas":
             from scas.loop import LoopClient
             from scas.service import CoordinatorService, make_server
@@ -380,6 +441,9 @@ class ArmContext:
         return None
 
     def close(self) -> None:
+        if self.hub is not None:
+            (self.out / "v2_snapshot.json").write_text(
+                json.dumps(self.hub.snapshot(), indent=2), encoding="utf-8")
         if self.service is not None:
             (self.out / "coordinator_snapshot.json").write_text(
                 json.dumps(self.service.snapshot(), indent=2), encoding="utf-8")
@@ -456,7 +520,7 @@ def run_agent(ctx: ArmContext, agent: str, box, workroot: Path, deadline: float,
     while time.time() + CYCLE_RESERVE_S < deadline:
         t_start = time.time()
         block, ginfo = ctx.guidance(agent)
-        prompt = "\n\n".join(x for x in (RULES, history_block(hist), block, TASK) if x)
+        prompt = "\n\n".join(x for x in (RULES + OWN_BRANCH_NOTE, history_block(hist), block, TASK) if x)
         prop = propose(wd, prompt, model)
         changed = git(wd, "status", "--porcelain").strip()
         stray = [ln for ln in changed.splitlines() if not ln.endswith("train.py")]
@@ -501,11 +565,194 @@ def run_agent(ctx: ArmContext, agent: str, box, workroot: Path, deadline: float,
                best, (time.time() - t_arm) / 60.0, row["description"][:70]))
 
 
+V2_BRANCH_NOTE = """- You work in a team on ONE shared train.py. It contains every change marked
+  KEPT in the team log below, whoever made it.
+"""
+
+
+def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: float,
+                 model: str) -> None:
+    """Shared-branch loop for the `scas2` arm (see scas/v2.py)."""
+    hub = ctx.hub
+    arm = ctx.arm
+    tagp = "%s_%s" % (arm, agent)
+    adir = ctx.out / agent
+    adir.mkdir(parents=True, exist_ok=True)
+    wd = workroot / arm / agent
+    if wd.exists():
+        shutil.rmtree(wd, ignore_errors=True)
+    wd.mkdir(parents=True)
+    tp = wd / "train.py"
+    head, code, idx = hub.head_state()
+    tp.write_text(code, encoding="utf-8", newline="\n")
+    git(wd, "init", "-q")
+    git(wd, "add", "train.py")
+    git(wd, "commit", "-q", "-m", "baseline")
+
+    tsv = adir / "results.tsv"
+    tsv.write_text("commit\tval_bpb\tmemory_gb\tstatus\tdescription\n", encoding="utf-8")
+    trace = adir / "trace.jsonl"
+    t_arm = time.time()
+
+    def record(row: dict) -> None:
+        with tsv.open("a", encoding="utf-8") as f:
+            f.write("%s\t%.6f\t%.1f\t%s\t%s\n" % (
+                row.get("version", "")[:7], row["val_bpb"],
+                (row.get("peak_vram_mb") or 0.0) / 1024.0, row["status"], row["description"]))
+        with trace.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({**row, "arm": arm, "agent": agent, "box": box.name}) + "\n")
+
+    def train(n: int) -> dict:
+        res = box.train(tp, "%s_%03d" % (tagp, n))
+        (adir / ("%03d.log" % n)).write_text(res.get("log_tail") or res.get("error") or "",
+                                             encoding="utf-8")
+        return res
+
+    def base_row(n, description, res, t_start, t_train) -> dict:
+        tail = [ln for ln in (res.get("log_tail") or "").strip().splitlines() if ln.strip()]
+        return {"n": n, "description": description, "t_start": t_start,
+                "t_train_start": t_train, "t_done": time.time(),
+                "val_bpb": res.get("val_bpb", 0.0), "num_steps": res.get("num_steps"),
+                "peak_vram_mb": res.get("peak_vram_mb"),
+                "error_line": None if "val_bpb" in res else (tail[-1] if tail else res.get("error"))}
+
+    t0 = time.time()
+    res = train(0)
+    if "val_bpb" not in res:
+        record({**base_row(0, "baseline, no changes", res, t0, t0), "status": "crash",
+                "best_before": None, "version": head})
+        log("%s: baseline failed on %s - agent stops" % (tagp, box.name))
+        return
+    hub.record_measurement(box.name, head, res["val_bpb"])
+    record({**base_row(0, "baseline, no changes", res, t0, t0), "status": "keep",
+            "best_before": None, "version": head})
+    log("%s: baseline %.6f on %s" % (tagp, res["val_bpb"], box.name))
+
+    n = 0
+    failures = 0
+    pending = None      # a kept edit that still has to be re-tested on a newer head
+    while time.time() + CYCLE_RESERVE_S < deadline:
+        t_start = time.time()
+        head, code, idx = hub.head_state()
+        git(wd, "reset", "-q", "--hard", "HEAD")
+        tp.write_text(code, encoding="utf-8", newline="\n")
+        if git(wd, "status", "--porcelain").strip():
+            git(wd, "commit", "-q", "-am", "sync to shared version %d" % idx)
+
+        if hub.needs_verification(box.name):
+            n += 1
+            res = train(n)
+            v = hub.verify(box.name, head, res.get("val_bpb"))
+            row = base_row(n, "re-measure shared version %d on this box" % idx, res, t_start, t_start)
+            row.update(status="verify" if v["ok"] else "verify_fail", kind="verify",
+                       best_before=v.get("expected"), version=head, coordinator=v)
+            record(row)
+            log("%s #%d verify v%d: measured %s, expected %.6f -> %s" % (
+                tagp, n, idx, res.get("val_bpb"), v.get("expected") or 0.0,
+                "ok" if v["ok"] else v.get("action", "failed")))
+            continue
+
+        directive, description, claim, dups = None, None, None, 0
+        if pending is not None:
+            pfile = adir / "pending.diff"
+            pfile.write_text(pending["diff"], encoding="utf-8", newline="\n")
+            try:
+                git(wd, "apply", "--3way", str(pfile))
+                merged = bool(git(wd, "diff", "HEAD").strip()) and not syntax_error(tp)
+            except RuntimeError:
+                merged = False
+            if merged:
+                directive = {"kind": "merge", "target": pending["description"], "target_id": None}
+                description = "merge: " + pending["description"]
+                claim = hub.claim(agent, box.name, head, git(wd, "diff", "HEAD"),
+                                  description, directive)["claim"]
+            else:
+                git(wd, "reset", "-q", "--hard", "HEAD")
+                directive = hub.combine_directive(pending["description"], pending["gain_pct"])
+            pending = None
+        else:
+            directive = hub.next_directive(agent)
+
+        prop = {}
+        if claim is None:
+            feedback = ""
+            err = None
+            for _ in range(3):
+                prompt = "\n\n".join((
+                    RULES + V2_BRANCH_NOTE, hub.history_text(),
+                    "A coordinator assigned you this directive; follow it:\n\n"
+                    + directive["text"] + feedback, TASK))
+                prop = propose(wd, prompt, model)
+                if any(not ln.endswith("train.py")
+                       for ln in git(wd, "status", "--porcelain").strip().splitlines()):
+                    git(wd, "clean", "-fdq")
+                err = prop.get("error")
+                if not err and not git(wd, "diff", "HEAD").strip():
+                    err = "agent made no change to train.py"
+                if not err:
+                    err = syntax_error(tp)
+                if err:
+                    git(wd, "reset", "-q", "--hard", "HEAD")
+                    break
+                c = hub.claim(agent, box.name, head, git(wd, "diff", "HEAD"),
+                              prop["description"], directive)
+                if "claim" in c:
+                    claim, description = c["claim"], prop["description"]
+                    break
+                dups += 1
+                d = c["duplicate"]
+                git(wd, "reset", "-q", "--hard", "HEAD")
+                feedback = ("\n\nYour previous proposal was refused before running because it "
+                            "repeats an experiment already on the log (%s, status %s):\n    \"%s\"\n"
+                            "Propose something different." % (d["reason"], d["status"], d["card"]))
+                log("%s: duplicate refused (%s): %s" % (tagp, d["reason"], prop["description"][:70]))
+            if claim is None:
+                hub.release(directive)
+                failures += 1
+                why = err or "three duplicate proposals in a row"
+                log("%s: proposal failed (%s)" % (tagp, why))
+                with trace.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"arm": arm, "agent": agent, "proposal_failed": why,
+                                        "t_start": t_start, "t_done": time.time(),
+                                        "guidance": {"mode": directive["kind"], "dups": dups}}) + "\n")
+                if failures >= 6:
+                    log("%s: six failed proposals in a row - agent stops" % tagp)
+                    return
+                time.sleep(15)
+                continue
+        failures = 0
+        n += 1
+        diff = git(wd, "diff", "HEAD")
+        (adir / ("%03d.diff" % n)).write_text(diff, encoding="utf-8")
+        t_train = time.time()
+        res = train(n)
+        out = hub.report(claim, res.get("val_bpb"), tp.read_text(encoding="utf-8"))
+        if out["status"] == "keep" and not out["promoted"]:
+            desc = description[7:] if description.startswith("merge: ") else description
+            pending = {"diff": diff, "description": desc, "gain_pct": out["gain_pct"]}
+        row = base_row(n, description, res, t_start, t_train)
+        row.update(status=out["status"], kind=directive["kind"], best_before=out["ref"],
+                   version=head, propose_secs=prop.get("secs"), cost_usd=prop.get("cost_usd"),
+                   guidance={"mode": directive["kind"], "dups": dups,
+                             "target": directive.get("target")},
+                   coordinator=out)
+        record(row)
+        log("%s #%d %-10s %-7s %+.2f%% %s(shared v%d, %.1f min into arm)  %s" % (
+            tagp, n, directive["kind"], out["status"], out["gain_pct"],
+            "PROMOTED " if out["promoted"] else ("re-test queued " if pending else ""),
+            out["head_index"], (time.time() - t_arm) / 60.0, description[:60]))
+
+
 def run_arm(arm: str, agents: list[str], boxes: list, out: Path, workroot: Path,
             hours: float, model: str, seed: int) -> None:
     adir = out / arm
     adir.mkdir(parents=True, exist_ok=True)
-    ctx = ArmContext(arm, agents, adir, seed)
+    base_code = None
+    if arm == "scas2":
+        tmp = adir / "base_train.py"
+        boxes[0].fetch_train_py(tmp)
+        base_code = tmp.read_text(encoding="utf-8")
+    ctx = ArmContext(arm, agents, adir, seed, base_code)
     t0 = time.time()
     deadline = t0 + hours * 3600.0
     (adir / "arm.json").write_text(json.dumps({
@@ -518,7 +765,8 @@ def run_arm(arm: str, agents: list[str], boxes: list, out: Path, workroot: Path,
 
     def guarded(agent, box):
         try:
-            run_agent(ctx, agent, box, workroot, deadline, model)
+            (run_agent_v2 if arm == "scas2" else run_agent)(
+                ctx, agent, box, workroot, deadline, model)
         except Exception:  # noqa: BLE001
             log("%s_%s died:\n%s" % (arm, agent, traceback.format_exc()))
 
@@ -609,7 +857,23 @@ def provision(st: dict, args, logdir: Path) -> bool:
            % (vastctl.REMOTE_TOOLS, args.repo, args.branch, args.dataset))
     rc, out = box.sh(cmd, timeout=40 * 60)
     (logdir / ("provision_%s.log" % st["instance_id"])).write_text(out, encoding="utf-8")
-    return rc == 0
+    if rc != 0:
+        return False
+    # The smoke test prints the training throughput. Boxes with the same GPU
+    # differed by 5% (162k-171k tok/s on RTX 4090s), which moved the baseline
+    # val_bpb from 0.574 to 0.587, so a slow box is rejected up front.
+    speeds = [int(x.replace(",", "")) for x in re.findall(r"tok/sec:\s*([0-9,]+)", out)]
+    cores = re.search(r"cpu cores:\s*(\d+)", out)
+    st["tok_per_sec"] = max(speeds) if speeds else None
+    st["cpu_cores"] = int(cores.group(1)) if cores else None
+    floor = args.min_tok_sec
+    if floor is None:
+        floor = MIN_TOK_SEC.get(args.gpu, 0)
+    if floor and (st["tok_per_sec"] or 0) < floor:
+        log("instance %s: %s tok/s is below the %d floor for %s"
+            % (st["instance_id"], st["tok_per_sec"], floor, args.gpu))
+        return False
+    return True
 
 
 def cmd_up(args) -> None:
@@ -801,6 +1065,9 @@ def main() -> None:
     sp.add_argument("--branch", default=vastctl.DEFAULT_BRANCH)
     sp.add_argument("--dataset", default="tinystories")
     sp.add_argument("--wait", type=int, default=15)
+    sp.add_argument("--min-tok-sec", type=int, default=None, dest="min_tok_sec",
+                    help="reject a box whose smoke-test throughput is below this "
+                         "(default: per-GPU floor, 0 disables)")
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_up)
 

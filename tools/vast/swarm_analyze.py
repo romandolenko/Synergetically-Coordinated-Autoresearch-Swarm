@@ -56,13 +56,17 @@ def knobs(plus: frozenset) -> frozenset:
     return frozenset(out)
 
 
+def is_experiment(r: dict) -> bool:
+    return r["n"] > 0 and r.get("kind") != "verify"
+
+
 def rel_improvement(rows: list[dict], until: float | None = None) -> float | None:
     """Fractional drop of best kept val_bpb below this agent's own baseline."""
     base = next((r["val_bpb"] for r in rows if r["n"] == 0 and r["status"] == "keep"), None)
     if base is None:
         return None
     kept = [r["val_bpb"] for r in rows
-            if r["status"] == "keep" and (until is None or r["t_done"] <= until)]
+            if r["status"] in ("keep", "verify") and (until is None or r["t_done"] <= until)]
     return (base - min(kept)) / base if kept else 0.0
 
 
@@ -71,11 +75,11 @@ def pct(x) -> str:
 
 
 def arm_summary(arm: dict) -> dict:
-    exps = [r for rows in arm["agents"].values() for r in rows if r["n"] > 0]
+    exps = [r for rows in arm["agents"].values() for r in rows if is_experiment(r)]
     rels = [rel_improvement(rows) for rows in arm["agents"].values()]
     rels = [x for x in rels if x is not None]
     kept_vals = [r["val_bpb"] for rows in arm["agents"].values() for r in rows
-                 if r["status"] == "keep"]
+                 if r["status"] in ("keep", "verify")]
     costs = [r.get("cost_usd") or 0.0 for r in exps]
     return {
         "experiments": len(exps),
@@ -108,7 +112,7 @@ def redundancy(arm: dict, embedder) -> dict:
     import numpy as np
 
     exps = sorted((r | {"agent": a} for a, rows in arm["agents"].items()
-                   for r in rows if r["n"] > 0), key=lambda r: r["t_start"])
+                   for r in rows if is_experiment(r)), key=lambda r: r["t_start"])
     solo = len(arm["agents"]) == 1
     for r in exps:
         r["z"] = embedder.embed(r["description"])
@@ -183,6 +187,51 @@ def scas_section(arm: dict, embedder) -> list[str]:
     return lines
 
 
+def scas2_section(arm: dict) -> list[str]:
+    lines = ["## SCAS v2 arm: what the coordinator did", ""]
+    rows = [r for rs in arm["agents"].values() for r in rs if r["n"] > 0]
+    exps = [r for r in rows if r.get("kind") != "verify"]
+    lines += ["| directive | experiments | kept | summed gain |", "| --- | --- | --- | --- |"]
+    for kind in ("tune", "structural", "refine", "merge", "combine"):
+        sub = [r for r in exps if r.get("kind") == kind]
+        if sub:
+            kept = [r for r in sub if r["status"] == "keep"]
+            lines.append("| %s | %d | %d | %.2f%% |" % (
+                kind, len(sub), len(kept),
+                sum((r.get("coordinator") or {}).get("gain_pct", 0.0) for r in kept)))
+    lines.append("")
+    promoted = sum(1 for r in exps if (r.get("coordinator") or {}).get("promoted"))
+    requeued = sum(1 for r in exps if r["status"] == "keep"
+                   and not (r.get("coordinator") or {}).get("promoted"))
+    ver = [r for r in rows if r.get("kind") == "verify"]
+    failed = [r for r in ver if r["status"] == "verify_fail"]
+    rolled = sum(1 for r in ver if (r.get("coordinator") or {}).get("action") == "rolled_back")
+    lines.append("- kept experiments promoted to the shared version: %d; kept on an "
+                 "outdated version and queued for a re-test: %d" % (promoted, requeued))
+    lines.append("- re-measurement runs: %d (%d disagreed, %d rollbacks)"
+                 % (len(ver), len(failed), rolled))
+    ev = arm["dir"] / "v2_events.jsonl"
+    if ev.exists():
+        events = [json.loads(x) for x in ev.read_text(encoding="utf-8").splitlines()]
+        dup = [e for e in events if e["event"] == "duplicate"]
+        lines.append("- proposals refused as duplicates before any GPU time: %d (%d identical "
+                     "edits, %d near-identical ideas)" % (
+                         len(dup), sum(e["reason"] == "identical edit" for e in dup),
+                         sum(e["reason"] != "identical edit" for e in dup)))
+    snap = arm["dir"] / "v2_snapshot.json"
+    if snap.exists():
+        s = json.loads(snap.read_text(encoding="utf-8"))
+        lines.append("- shared version at the end: %d changes deep" % (len(s["chain"]) - 1))
+        for c in s["chain"][1:]:
+            lines.append("  - %+.2f%% (%s) %s" % (100 * (1 - c["ratio"]), c["by"], c["desc"][:120]))
+        t = sorted(s.get("refine_targets") or [], key=lambda x: -x["children"])[:5]
+        if t:
+            lines.append("- most-refined targets: " + "; ".join(
+                "%dx \"%s\"" % (x["children"], x["card"][:50]) for x in t))
+    lines.append("")
+    return lines
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -238,6 +287,8 @@ def main() -> None:
 
     if "scas" in arms:
         L += scas_section(arms["scas"], embedder)
+    if "scas2" in arms:
+        L += scas2_section(arms["scas2"])
 
     L += ["## 4. Agent overhead", "",
           "| arm | failed proposals | agent cost (API-equivalent) |", "| --- | --- | --- |"]
