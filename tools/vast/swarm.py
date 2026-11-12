@@ -224,6 +224,8 @@ class FakeBox:
         if rest != rest0:
             u = int(hashlib.sha256(rest.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
             f *= 1.0 + (u - 0.7) * 0.02
+            w = int(hashlib.sha256((self.name + rest).encode("utf-8")).hexdigest()[:8], 16)
+            f *= 1.0 + (w / 0xFFFFFFFF - 0.3) * 0.012
         return 0.576 * self.scale * f
 
     def train(self, train_py: Path, tag: str) -> dict:
@@ -658,7 +660,29 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
             continue
 
         directive, description, claim, dups = None, None, None, 0
-        if pending is not None:
+        abl = hub.ablation_directive(box.name)
+        if abl is not None:
+            # three-way merge that takes the suspect change out of the head
+            fa, fb = adir / "ablate_with.py", adir / "ablate_without.py"
+            fa.write_text(abl["with_code"], encoding="utf-8", newline="\n")
+            fb.write_text(abl["without_code"], encoding="utf-8", newline="\n")
+            try:
+                git(wd, "merge-file", "train.py", str(fa), str(fb))
+                clean = bool(git(wd, "diff", "HEAD").strip()) and not syntax_error(tp)
+            except RuntimeError:
+                clean = False
+            if clean:
+                directive = abl
+                description = "ablation: shared version without \"%s\"" % abl["target"][:150]
+                claim = hub.claim(agent, box.name, head, git(wd, "diff", "HEAD"),
+                                  description, directive)["claim"]
+            else:
+                git(wd, "reset", "-q", "--hard", "HEAD")
+                log("%s: ablation of \"%s\" does not apply cleanly - skipped"
+                    % (tagp, abl["target"][:60]))
+        if claim is not None:
+            pass
+        elif pending is not None:
             pfile = adir / "pending.diff"
             pfile.write_text(pending["diff"], encoding="utf-8", newline="\n")
             try:
@@ -735,9 +759,31 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
         (adir / ("%03d.diff" % n)).write_text(diff, encoding="utf-8")
         t_train = time.time()
         res = train(n)
-        out = hub.report(claim, res.get("val_bpb"), tp.read_text(encoding="utf-8"))
+        cand_code = tp.read_text(encoding="utf-8")
+        t_exp_done = time.time()
+        out = hub.report(claim, res.get("val_bpb"), cand_code)
+        recheck_row = None
+        if out["status"] == "recheck":
+            # lost to an estimate by less than the estimate can be wrong:
+            # measure the version it was built on here, then decide
+            tp.write_text(out["base_code"], encoding="utf-8", newline="\n")
+            res2 = train(n + 1)
+            if "val_bpb" in res2:
+                hub.record_measurement(box.name, out["base"], res2["val_bpb"])
+            recheck_row = base_row(n + 1, "re-measure shared version %d on this box (close call)"
+                                   % out["base_index"], res2, t_exp_done, t_exp_done)
+            recheck_row.update(
+                status="verify" if "val_bpb" in res2 else "verify_fail", kind="verify",
+                best_before=out["ref"], version=out["base"],
+                coordinator={"expected": out["ref"], "measured": res2.get("val_bpb"),
+                             "recheck_of": n})
+            log("%s #%d close call against an estimate (%.6f vs est. %.6f): base measured %s"
+                % (tagp, n, res["val_bpb"], out["ref"], res2.get("val_bpb")))
+            out = hub.report(claim, res.get("val_bpb"), cand_code)
         adopted = False
-        if out["status"] == "keep" and not out["promoted"]:
+        if directive["kind"] == "ablate":
+            pass                                 # an ablation is never re-tested or adopted
+        elif out["status"] == "keep" and not out["promoted"]:
             desc = description[7:] if description.startswith("merge: ") else description
             if directive["kind"] in ("merge", "combine"):
                 # kept on two bases already: if it still applies cleanly to the
@@ -765,12 +811,16 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
                    guidance={"mode": directive["kind"], "dups": dups,
                              "target": directive.get("target")},
                    coordinator=out)
+        row["t_done"] = t_exp_done
         record(row)
         log("%s #%d %-10s %-7s %+.2f%% %s(shared v%d, %.1f min into arm)  %s" % (
             tagp, n, directive["kind"], out["status"], out["gain_pct"],
             "PROMOTED " if out["promoted"] else (
                 "ADOPTED " if adopted else ("re-test queued " if pending else "")),
             out["head_index"], (time.time() - t_arm) / 60.0, description[:60]))
+        if recheck_row is not None:
+            record(recheck_row)
+            n += 1
 
 
 def run_arm(arm: str, agents: list[str], boxes: list, out: Path, workroot: Path,

@@ -29,6 +29,25 @@ Each mechanism here answers one measured failure:
    between ``tune``, ``structural`` and ``refine`` from the gains each kind
    has recently produced, shared by all agents.
 
+Two corrections from the proof run of 2026-11-12 (three RTX 4080 Super boxes).
+All four re-measurements of the shared version came out 0.6-3.3% worse than
+the cross-box estimate, an error as large as a typical gain:
+
+5. **Re-measure before discarding on an estimate.** 18 of 39 experiments were
+   judged against an estimate, and all 10 discards among them missed by less
+   than that error. A result that loses to an estimated reference by less than
+   ``recheck_tol`` per estimated hop is not decided: ``report`` answers
+   ``recheck``, the driver measures the base version on that box and reports
+   again against the measured value.
+
+6. **Re-measurements are compared with the estimate.** The old check passed
+   whenever the head beat the box's last measurement, which the large early
+   gains made certain. Now a head that measures more than ``verify_tol`` worse
+   than estimated names one promotion from another box as suspect (the largest
+   one small enough to be absent here), and that box runs an ablation: the
+   head without that change. If the ablated version wins it becomes the head
+   and the change is withdrawn.
+
 The SCT law (emergent groups, psi) still runs on every report and its output
 is logged, but v2 guidance does not depend on it.
 
@@ -118,6 +137,8 @@ class SwarmV2:
         verify_after: int = 3,
         dup_cos: float = 0.86,
         dup_window: int = 2,
+        recheck_tol: float = 0.015,
+        verify_tol: float = 0.01,
         ucb_c: float = 0.5,
         discount: float = 0.95,
         seed: int = 0,
@@ -130,6 +151,8 @@ class SwarmV2:
         self.verify_after = verify_after
         self.dup_cos = dup_cos
         self.dup_window = dup_window
+        self.recheck_tol = recheck_tol
+        self.verify_tol = verify_tol
         self.ucb_c = ucb_c
         self.discount = discount
         self.rng = random.Random(seed)
@@ -146,6 +169,8 @@ class SwarmV2:
         self.rejected: set[str] = set()
         self.refs: dict[str, dict[str, float]] = {}      # box -> hash -> measured val
         self.disputed: dict[str, str] = {}               # box -> head it failed once
+        self.suspects: dict[str, str] = {}               # box -> version to ablate there
+        self.ablated: set[str] = set()                   # versions already put to that test
         self.archive: list[dict] = []                    # finished experiments
         self.inflight: dict[int, dict] = {}              # claim id -> experiment
         self._next_claim = 1
@@ -219,6 +244,24 @@ class SwarmV2:
             out["ok"] = ok
             if ok:
                 self.disputed.pop(box, None)
+                if expected:
+                    gap = val / expected - 1.0
+                    out["gap_pct"] = 100.0 * gap
+                    if gap > self.verify_tol:
+                        # the chain delivered less here than promised: which single
+                        # foreign promotion could be missing entirely on this box?
+                        cand, cur = [], h
+                        while cur != anchor:
+                            v = self.versions[cur]
+                            if (v["by"] != box and cur not in self.ablated
+                                    and 0.0 < 1.0 - v["ratio"] <= gap):
+                                cand.append((1.0 - v["ratio"], cur))
+                            cur = v["parent"]
+                        if cand:
+                            s = max(cand)[1]
+                            self.suspects[box] = s
+                            self.ablated.add(s)
+                            out["suspect"] = s
             elif self.disputed.get(box) != h:
                 self.disputed[box] = h
                 if val is not None:
@@ -239,13 +282,30 @@ class SwarmV2:
             self._event("verify", box=box, **out)
             return out
 
+    def ablation_directive(self, box: str) -> dict | None:
+        """The ablation ``box`` owes after a re-measurement that fell short, or
+        None. Only valid while the box has a measurement of the current head."""
+        with self.lock:
+            s = self.suspects.pop(box, None)
+            if s is None or self.reference(box)[1] != 0:
+                return None
+            cur = self.head
+            while cur is not None and cur != s:
+                cur = self.versions[cur]["parent"]
+            v = self.versions[s]
+            if cur is None or v["parent"] is None:
+                return None                      # already rolled back or withdrawn
+            self._event("ablation", box=box, version=s, card=v["desc"])
+            return {"kind": "ablate", "target": v["desc"], "target_id": None, "ablates": s,
+                    "with_code": self.codes[s], "without_code": self.codes[v["parent"]]}
+
     # ------------------------------------------------------------ directives
 
     def next_directive(self, agent: str) -> dict:
         with self.lock:
             targets = [e for e in self.archive
                        if e["status"] == "keep" and e["gain_pct"] > 0
-                       and e["kind"] not in ("merge", "combine")]
+                       and e["kind"] not in ("merge", "combine", "ablate")]
             arms = [k for k in KINDS if k != "refine" or targets]
             total = sum(self.bandit[k]["n"] + self.bandit[k]["pending"] for k in arms)
             best, best_score = None, -1.0
@@ -297,7 +357,7 @@ class SwarmV2:
             const = is_constant_edit(diff)
             z = self.embedder.embed(card)
             base_idx = self.versions[base]["index"] if base in self.versions else 0
-            if kind not in ("merge", "combine"):
+            if kind not in ("merge", "combine", "ablate"):
                 for e in list(self.inflight.values()) + self.archive:
                     recent = base_idx - e["base_index"] <= self.dup_window
                     same_edit = e["key"] == key and (e["base"] == base or recent)
@@ -314,17 +374,33 @@ class SwarmV2:
                 "id": cid, "agent": agent, "box": box, "base": base, "base_index": base_idx,
                 "key": key, "constant": const, "card": card, "z": z, "kind": kind,
                 "target_id": directive.get("target_id"), "t_claim": time.time(),
+                "ablates": directive.get("ablates"),
             }
             return {"claim": cid}
 
     # --------------------------------------------------------------- report
 
     def report(self, claim_id: int, val: float | None, new_code: str | None = None) -> dict:
-        """Outcome of a claimed experiment. ``val`` None means it crashed."""
+        """Outcome of a claimed experiment. ``val`` None means it crashed.
+
+        Returns ``status: "recheck"`` (once per experiment, and the claim stays
+        open) when the result loses to an *estimated* reference by less than the
+        estimate can be wrong. The driver then trains ``base_code`` on that box,
+        calls ``record_measurement`` and reports the same result again."""
         with self.lock:
-            e = self.inflight.pop(claim_id)
+            e = self.inflight[claim_id]
             box, base, kind = e["box"], e["base"], e["kind"]
             ref, hops = self.reference(box, base)
+            if (val is not None and ref is not None and hops > 0 and self.recheck_tol > 0
+                    and not e.get("rechecked")
+                    and ref - self.est_margin <= val < ref * (1.0 + self.recheck_tol * hops)):
+                e["rechecked"] = True
+                self._event("recheck", box=box, base=base, ref=ref, hops=hops, val=val,
+                            card=e["card"])
+                return {"status": "recheck", "base": base, "base_code": self.codes[base],
+                        "base_index": self.versions[base]["index"],
+                        "ref": ref, "ref_estimated_hops": hops}
+            del self.inflight[claim_id]
             out = {"ref": ref, "ref_estimated_hops": hops, "promoted": False,
                    "head_moved": base != self.head}
             if val is None or ref is None:
@@ -346,6 +422,10 @@ class SwarmV2:
                     self.head = h
                     e["new_hash"] = h
                     out["promoted"] = True
+                    if kind == "ablate":         # the head without it is better: withdraw it
+                        for a in self.archive:
+                            if a.get("new_hash") == e["ablates"]:
+                                a["status"] = "rejected"
             e["children"] = 0
             e["t_done"] = time.time()
             if kind in self.bandit:
@@ -369,6 +449,7 @@ class SwarmV2:
                     pass
             self.archive.append(e)
             out.update(status=e["status"], gain_pct=e["gain_pct"], kind=kind, box=box,
+                       rechecked=bool(e.get("rechecked")),
                        head=self.head, head_index=self.versions[self.head]["index"])
             self._event("report", **{k: v for k, v in e.items() if k != "z"},
                         promoted=out["promoted"], head=self.head)
@@ -443,7 +524,7 @@ class SwarmV2:
                 "by_kind": {k: {"n": sum(1 for e in self.archive if e["kind"] == k),
                                 "kept": sum(1 for e in self.archive
                                             if e["kind"] == k and e["status"] == "keep")}
-                            for k in KINDS + ("merge", "combine")},
+                            for k in KINDS + ("merge", "combine", "ablate")},
                 "refine_targets": [{"card": e["card"], "gain_pct": e["gain_pct"],
                                     "children": e["children"]}
                                    for e in self.archive if e.get("children")],

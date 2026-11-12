@@ -192,7 +192,7 @@ def scas2_section(arm: dict) -> list[str]:
     rows = [r for rs in arm["agents"].values() for r in rs if r["n"] > 0]
     exps = [r for r in rows if r.get("kind") != "verify"]
     lines += ["| directive | experiments | kept | summed gain |", "| --- | --- | --- | --- |"]
-    for kind in ("tune", "structural", "refine", "merge", "combine"):
+    for kind in ("tune", "structural", "refine", "merge", "combine", "ablate"):
         sub = [r for r in exps if r.get("kind") == kind]
         if sub:
             kept = [r for r in sub if r["status"] == "keep"]
@@ -215,6 +215,17 @@ def scas2_section(arm: dict) -> list[str]:
     ev = arm["dir"] / "v2_events.jsonl"
     if ev.exists():
         events = [json.loads(x) for x in ev.read_text(encoding="utf-8").splitlines()]
+        rc = [e for e in events if e["event"] == "recheck"]
+        flipped = sum(1 for r in exps if (r.get("coordinator") or {}).get("rechecked")
+                      and r["status"] == "keep")
+        lines.append("- close calls against an estimated reference that were re-measured "
+                     "before deciding: %d (%d turned out to be keeps)" % (len(rc), flipped))
+        gaps = [e["gap_pct"] for e in events if e["event"] == "verify" and "gap_pct" in e]
+        if gaps:
+            lines.append("- scheduled re-measurements against the estimate: mean %+.2f%%, worst "
+                         "%+.2f%%; ablations ordered: %d" % (
+                             sum(gaps) / len(gaps), max(gaps),
+                             sum(e["event"] == "ablation" for e in events)))
         dup = [e for e in events if e["event"] == "duplicate"]
         lines.append("- proposals refused as duplicates before any GPU time: %d (%d identical "
                      "edits, %d near-identical ideas)" % (

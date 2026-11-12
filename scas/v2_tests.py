@@ -89,7 +89,7 @@ def test_discard_and_crash_leave_head_alone():
 
 
 def test_estimated_reference_needs_the_wider_margin():
-    h = hub(margin=0.0005, est_margin=0.0015)
+    h = hub(margin=0.0005, est_margin=0.0015, recheck_tol=0.0)
     run(h, "a0", "b0", ("A = 1", "A = 9"), 0.90, "Raised A")
     # b1's reference for the new head is an estimate (0.99): 0.001 better is not enough
     assert run(h, "a1", "b1", ("B = 2", "B = 3"), 0.9890, "Raised B")["status"] == "discard"
@@ -281,3 +281,79 @@ def test_merge_results_are_not_refine_targets():
     run(h, "a0", "b0", ("A = 1", "A = 9"), 0.90, "merge: Raised A", kind="merge")
     assert h.next_directive("a0")["kind"] != "refine"
     h.bandit["tune"]["pending"] = 0
+
+
+# ------------------------------------------- close calls against an estimate
+
+def close_call(h, val):
+    run(h, "a0", "b0", ("A = 1", "A = 9"), 0.95, "Raised A")     # b1 now estimates 1.045
+    head, code, _ = h.head_state()
+    c = h.claim("a1", "b1", head, diff("B = 2", "B = 3"), "Raised B",
+                {"kind": "tune", "target_id": None})["claim"]
+    new_code = code.replace("B = 2", "B = 3")
+    return head, c, new_code, h.report(c, val, new_code)
+
+
+def test_close_loss_against_an_estimate_is_rechecked_and_can_become_a_keep():
+    h = hub()
+    head, c, new_code, out = close_call(h, 1.05)                 # 0.5% behind the estimate
+    assert out["status"] == "recheck" and out["base"] == head
+    assert out["base_code"] == h.codes[head] and c in h.inflight
+    h.record_measurement("b1", head, 1.06)                       # the estimate was too rosy
+    out = h.report(c, 1.05, new_code)
+    assert out["status"] == "keep" and out["promoted"] and out["rechecked"]
+    assert out["ref"] == 1.06 and out["ref_estimated_hops"] == 0
+
+
+def test_recheck_happens_once_and_a_clear_loss_is_discarded_outright():
+    h = hub()
+    head, c, new_code, out = close_call(h, 1.05)
+    assert out["status"] == "recheck"
+    # the base run crashed, nothing was measured: decide on the estimate after all
+    assert h.report(c, 1.05, new_code)["status"] == "discard"
+    h2 = hub()
+    assert close_call(h2, 1.10)[3]["status"] == "discard"        # 5% behind: no doubt
+
+
+# ------------------------------------- re-measurement that falls short
+
+def test_small_gap_on_re_measurement_names_no_suspect():
+    h = hub(verify_after=3)
+    promote_three(h)
+    v = h.verify("b1", h.head, 0.94)                             # estimate 0.935
+    assert v["ok"] and "suspect" not in v and h.ablation_directive("b1") is None
+
+
+def test_shortfall_orders_an_ablation_that_can_withdraw_a_change():
+    h = hub(verify_after=3)
+    promote_three(h)
+    head = h.head
+    v = h.verify("b1", head, 1.0)                # better than 1.1, but 7% short of 0.935
+    assert v["ok"] and v["gap_pct"] > 6 and v["suspect"] == head
+    assert h.ablation_directive("b0") is None    # only the box that saw the gap
+    d = h.ablation_directive("b1")
+    assert d["kind"] == "ablate" and d["target"] == "Raised B"
+    assert "B = 3" in d["with_code"] and "B = 2" in d["without_code"]
+    assert h.ablation_directive("b1") is None    # ordered once
+    c = h.claim("a1", "b1", head, diff("B = 3", "B = 2"), "ablation: Raised B", d)["claim"]
+    out = h.report(c, 0.99, d["without_code"].replace("A = 1", "A = 3"))
+    assert out["status"] == "keep" and out["promoted"]
+    withdrawn = [e for e in h.archive if e["card"] == "Raised B"]
+    assert withdrawn[0]["status"] == "rejected"
+    assert "withdrawn" in h.history_text()
+    # the ablation itself is not something to refine, and is never ablated again
+    assert all(e["kind"] != "ablate" or not e.get("children") for e in h.archive)
+    h.verify("b2", h.head, 1.19)
+    assert h.suspects.get("b2") != head
+
+
+def test_ablation_that_does_not_help_leaves_the_head_alone():
+    h = hub(verify_after=3)
+    promote_three(h)
+    head = h.head
+    h.verify("b1", head, 1.0)
+    d = h.ablation_directive("b1")
+    c = h.claim("a1", "b1", head, diff("B = 3", "B = 2"), "ablation: Raised B", d)["claim"]
+    out = h.report(c, 1.02, d["without_code"])
+    assert out["status"] == "discard" and h.head == head
+    assert [e for e in h.archive if e["card"] == "Raised B"][0]["status"] == "keep"
