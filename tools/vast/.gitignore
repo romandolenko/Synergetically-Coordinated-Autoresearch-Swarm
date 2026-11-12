@@ -1,2 +1,4 @@
 .env.vast
 .state.json
+.swarm_state.json
+.swarm_logs/
