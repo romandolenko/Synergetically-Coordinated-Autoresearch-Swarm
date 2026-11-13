@@ -306,7 +306,30 @@ def find_claude() -> str:
     return exe
 
 
+RETRY_DELAYS_S = (30, 60, 120, 240, 300, 300, 300, 300)
+
+
 def propose(workdir: Path, prompt: str, model: str, timeout: int = 900) -> dict:
+    """One proposal from the agent. A failed call (network error, 403 from the
+    API's front end, garbled output) is retried with a growing pause, for up to
+    about 27 minutes: in the run of 2026-11-13 a two-minute outage stopped two
+    of three agents for the remaining four hours. A usage limit and a timeout
+    are returned at once."""
+    for delay in RETRY_DELAYS_S + (None,):
+        out = _propose_once(workdir, prompt, model, timeout)
+        err = out.get("error")
+        if not err or out.get("fatal") or err == "agent timed out" or delay is None:
+            return out
+        log("%s: agent call failed (%s) - retrying in %d s" % (workdir.name, err[:120], delay))
+        try:
+            git(workdir, "checkout", "--", "train.py")
+        except RuntimeError:
+            pass
+        time.sleep(delay)
+    return out
+
+
+def _propose_once(workdir: Path, prompt: str, model: str, timeout: int = 900) -> dict:
     """One fresh headless session. It can only read and edit files in workdir."""
     cmd = [find_claude(), "-p", "--model", model,
            "--tools", "Read,Edit,Grep",
