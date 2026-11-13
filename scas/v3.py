@@ -61,7 +61,7 @@ V3_KINDS = KINDS + ("model",)
 
 # (constant, how to step it): factors multiply, offsets add
 STEPS = {
-    "TOTAL_BATCH_SIZE": ("mul", (0.5, 2.0)),
+    "TOTAL_BATCH_SIZE": ("mul", (0.0625, 0.125, 0.25, 0.5, 2.0)),
     "EMBEDDING_LR": ("mul", (0.5, 0.7, 1.4, 2.0)),
     "UNEMBEDDING_LR": ("mul", (0.5, 0.7, 1.4, 2.0)),
     "MATRIX_LR": ("mul", (0.5, 0.7, 0.85, 1.2, 1.4, 2.0)),
@@ -73,7 +73,7 @@ STEPS = {
     "WARMDOWN_RATIO": ("add", (-0.2, -0.1, 0.1, 0.2, 0.3)),
     "FINAL_LR_FRAC": ("add", (0.02, 0.05, 0.1, -0.05)),
 }
-LIMITS = {"TOTAL_BATCH_SIZE": (2 ** 13, 2 ** 21), "WARMUP_RATIO": (0.0, 0.3),
+LIMITS = {"TOTAL_BATCH_SIZE": (2 ** 15, 2 ** 21), "WARMUP_RATIO": (0.0, 0.3),
           "WARMDOWN_RATIO": (0.0, 0.95), "FINAL_LR_FRAC": (0.0, 0.5),
           "BETA1": (0.5, 0.98), "BETA2": (0.8, 0.999)}
 
