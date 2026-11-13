@@ -190,7 +190,8 @@ class SwarmV2:
 
     # ------------------------------------------------------- reference values
 
-    def record_measurement(self, box: str, h: str, val: float) -> None:
+    def record_measurement(self, box: str, h: str, val: float,
+                           steps: float | None = None) -> None:
         with self.lock:
             self.refs.setdefault(box, {})[h] = float(val)
             self._event("measured", box=box, version=h, val=val)
@@ -226,7 +227,7 @@ class SwarmV2:
             _, hops = self.reference(box)
             return hops >= self.verify_after
 
-    def verify(self, box: str, h: str, val: float | None) -> dict:
+    def verify(self, box: str, h: str, val: float | None, steps: float | None = None) -> dict:
         """``box`` trained version ``h`` (None = it crashed there). The chain
         since the box's last measurement must be a real improvement on this
         box too. First failure: disputed, measure again. Second: roll back."""
@@ -301,7 +302,7 @@ class SwarmV2:
 
     # ------------------------------------------------------------ directives
 
-    def next_directive(self, agent: str) -> dict:
+    def next_directive(self, agent: str, box: str | None = None) -> dict:
         with self.lock:
             targets = [e for e in self.archive
                        if e["status"] == "keep" and e["gain_pct"] > 0
@@ -348,7 +349,7 @@ class SwarmV2:
     # --------------------------------------------------------------- dedup
 
     def claim(self, agent: str, box: str, base: str, diff: str, card: str,
-              directive: dict) -> dict:
+              directive: dict, new_code: str | None = None) -> dict:
         """Register an experiment before it trains. Returns ``{"claim": id}``
         or ``{"duplicate": {...}}`` when the idea was already tried recently."""
         with self.lock:
@@ -357,7 +358,7 @@ class SwarmV2:
             const = is_constant_edit(diff)
             z = self.embedder.embed(card)
             base_idx = self.versions[base]["index"] if base in self.versions else 0
-            if kind not in ("merge", "combine", "ablate"):
+            if kind not in ("merge", "combine", "ablate", "model"):
                 for e in list(self.inflight.values()) + self.archive:
                     recent = base_idx - e["base_index"] <= self.dup_window
                     same_edit = e["key"] == key and (e["base"] == base or recent)
@@ -380,7 +381,8 @@ class SwarmV2:
 
     # --------------------------------------------------------------- report
 
-    def report(self, claim_id: int, val: float | None, new_code: str | None = None) -> dict:
+    def report(self, claim_id: int, val: float | None, new_code: str | None = None,
+               steps: float | None = None) -> dict:
         """Outcome of a claimed experiment. ``val`` None means it crashed.
 
         Returns ``status: "recheck"`` (once per experiment, and the claim stays
@@ -496,7 +498,7 @@ class SwarmV2:
                      "  status        change  description"]
             for e in self.archive:
                 st = {"keep": "KEPT" if e.get("new_hash") else "kept-not-merged",
-                      "discard": "discard", "crash": "crash",
+                      "discard": "discard", "crash": "crash", "uncertain": "unclear",
                       "rejected": "withdrawn"}[e["status"]]
                 ch = "   -   " if e["status"] == "crash" else "%+6.2f%%" % e["gain_pct"]
                 lines.append("  %-13s %s  %s" % (st, ch, e["card"]))

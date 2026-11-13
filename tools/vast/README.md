@@ -180,10 +180,10 @@ Measured on the unmodified `train.py` (one baseline run per card, 2026-11-12):
 
 ## The swarm comparison
 
-`swarm.py` runs live agents (headless `claude -p` sessions) in up to five arms:
+`swarm.py` runs live agents (headless `claude -p` sessions) in up to six arms:
 `scas` (v1 coordinator packets), `scas2` (the v2 coordinator in `scas/v2.py`: one shared
 `train.py`, duplicate check, discounted refine targets, bandit over directive kinds),
-`independent`, `hub` (shared tried-list) and `single` (one agent, K times the time).
+`scas3` (v2 plus a model of the results, see below), `independent`, `hub` (shared tried-list) and `single` (one agent, K times the time).
 
 ```powershell
 uv run python tools/vast/swarm.py up --boxes 3
@@ -194,6 +194,28 @@ uv run python tools/vast/swarm.py run --fake --arms scas2 --hours 0.2   # stub t
 
 The machine running it must stay awake, and the agents draw on the Claude subscription;
 if its usage limit is hit the agents stop and the run ends.
+
+### The v3 arm (`scas3`) and its memory
+
+`scas3` (`scas/v3.py`) keeps the v2 shared version and replaces every numeric judgement
+with a model over explicit settings (`scas/surrogate.py`): constants, structural-change
+flags and box speed tracked from the optimizer steps each run reports. The model decides
+keep/discard by probability, refuses constant edits it already expects not to help,
+proposes numeric steps itself (directive kind `model`, no agent call) and asks for a
+re-measurement of the shared version only where it is unsure.
+
+The model starts from the experiments of earlier runs:
+
+```powershell
+uv run python tools/vast/memory_build.py          # vast_runs/swarm-* -> scas/data/v3_memory.jsonl
+uv run python tools/vast/surrogate_eval.py        # leave-one-run-out test of the model
+uv run python tools/vast/surrogate_eval.py --fit  # refit, write scas/data/v3_surrogate.json
+uv run python tools/vast/swarm.py run --arms scas3,hub --hours 2
+uv run python tools/vast/swarm.py run --arms scas3 --no-memory      # cold start, for comparison
+```
+
+After a GPU run, rebuild the memory and refit so the next run starts from it. `--fake`
+always starts with an empty model: the remembered experiments are from real GPUs.
 
 ---
 

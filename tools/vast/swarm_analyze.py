@@ -187,12 +187,12 @@ def scas_section(arm: dict, embedder) -> list[str]:
     return lines
 
 
-def scas2_section(arm: dict) -> list[str]:
-    lines = ["## SCAS v2 arm: what the coordinator did", ""]
+def scas2_section(arm: dict, v: str = "v2") -> list[str]:
+    lines = ["## SCAS %s arm: what the coordinator did" % v, ""]
     rows = [r for rs in arm["agents"].values() for r in rs if r["n"] > 0]
     exps = [r for r in rows if r.get("kind") != "verify"]
     lines += ["| directive | experiments | kept | summed gain |", "| --- | --- | --- | --- |"]
-    for kind in ("tune", "structural", "refine", "merge", "combine", "ablate"):
+    for kind in ("tune", "structural", "refine", "model", "merge", "combine", "ablate"):
         sub = [r for r in exps if r.get("kind") == kind]
         if sub:
             kept = [r for r in sub if r["status"] == "keep"]
@@ -212,7 +212,7 @@ def scas2_section(arm: dict) -> list[str]:
                  "keep without a third run: %d" % (promoted, requeued, adopted))
     lines.append("- re-measurement runs: %d (%d disagreed, %d rollbacks)"
                  % (len(ver), len(failed), rolled))
-    ev = arm["dir"] / "v2_events.jsonl"
+    ev = arm["dir"] / ("%s_events.jsonl" % v)
     if ev.exists():
         events = [json.loads(x) for x in ev.read_text(encoding="utf-8").splitlines()]
         rc = [e for e in events if e["event"] == "recheck"]
@@ -226,12 +226,17 @@ def scas2_section(arm: dict) -> list[str]:
                          "%+.2f%%; ablations ordered: %d" % (
                              sum(gaps) / len(gaps), max(gaps),
                              sum(e["event"] == "ablation" for e in events)))
+        if v == "v3":
+            veto = [e for e in events if e["event"] == "veto"]
+            unc = sum(1 for r in exps if r["status"] == "uncertain")
+            lines.append("- proposals the model refused before any GPU time: %d; results it "
+                         "could not call and ran once more: %d" % (len(veto), unc))
         dup = [e for e in events if e["event"] == "duplicate"]
         lines.append("- proposals refused as duplicates before any GPU time: %d (%d identical "
                      "edits, %d near-identical ideas)" % (
                          len(dup), sum(e["reason"] == "identical edit" for e in dup),
                          sum(e["reason"] != "identical edit" for e in dup)))
-    snap = arm["dir"] / "v2_snapshot.json"
+    snap = arm["dir"] / ("%s_snapshot.json" % v)
     if snap.exists():
         s = json.loads(snap.read_text(encoding="utf-8"))
         lines.append("- shared version at the end: %d changes deep" % (len(s["chain"]) - 1))
@@ -302,6 +307,8 @@ def main() -> None:
         L += scas_section(arms["scas"], embedder)
     if "scas2" in arms:
         L += scas2_section(arms["scas2"])
+    if "scas3" in arms:
+        L += scas2_section(arms["scas3"], "v3")
 
     L += ["## 4. Agent overhead", "",
           "| arm | failed proposals | agent cost (API-equivalent) |", "| --- | --- | --- |"]

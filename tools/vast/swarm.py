@@ -54,7 +54,9 @@ KEEP_MARGIN = 0.0005
 TRAIN_TIMEOUT_S = 720       # program.md: kill anything past ~10 minutes
 POLL_S = 6                  # was 20: an idle GPU for ~10 s per run, 2.5% of the rental
 CYCLE_RESERVE_S = 9 * 60    # do not start an experiment that cannot finish
-ARMS = ("scas", "scas2", "independent", "hub", "single")
+ARMS = ("scas", "scas2", "scas3", "independent", "hub", "single")
+SHARED_ARMS = ("scas2", "scas3")     # one shared train.py, coordinated by a hub
+V3_MEMORY = True                     # scas3 starts from scas/data/v3_memory.jsonl
 # Smoke-test throughput a box must reach to be used (`up --min-tok-sec` overrides).
 # Measured on the unmodified train.py; see tools/vast/README.md "Hardware".
 MIN_TOK_SEC = {"RTX_4090": 168000}
@@ -233,8 +235,12 @@ class FakeBox:
         if self.rng.random() < 0.03 and not tag.endswith("_000"):
             return {"error": "crash", "exit_code": 1,
                     "log_tail": "RuntimeError: fake shape mismatch"}
-        val = self.score(train_py.read_text(encoding="utf-8")) + self.rng.uniform(-0.0002, 0.0002)
-        return {"val_bpb": round(val, 6), "peak_vram_mb": 6300.0, "num_steps": 300,
+        code = train_py.read_text(encoding="utf-8")
+        val = self.score(code) + self.rng.uniform(-0.0002, 0.0002)
+        c, _ = self._split(code)
+        steps = round(62 / self.scale ** 3 * (2 ** 19 / max(c.get("TOTAL_BATCH_SIZE", 2 ** 19), 2.0)) ** 0.94
+                      * (8 / max(c.get("DEPTH", 8), 1)) ** 0.5)
+        return {"val_bpb": round(val, 6), "peak_vram_mb": 6300.0, "num_steps": max(steps, 1),
                 "exit_code": 0, "log_tail": "val_bpb: %.6f" % val}
 
 
@@ -386,6 +392,15 @@ class ArmContext:
                 sct=EmergentSCTCoordinator(agents, 3, psi_0=SCT_PSI_0,
                                            alpha_temp=SCT_ALPHA_TEMP),
             )
+        if arm == "scas3":
+            from scas.embedder import Embedder
+            from scas.surrogate import load_memory
+            from scas.v3 import SwarmV3
+
+            memory = load_memory() if V3_MEMORY else []
+            log("scas3: model starts from %d remembered experiments" % len(memory))
+            self.hub = SwarmV3(base_code, Embedder(), memory=memory, seed=seed,
+                               event_log=out / "v3_events.jsonl")
         if arm == "scas":
             from scas.loop import LoopClient
             from scas.service import CoordinatorService, make_server
@@ -446,7 +461,7 @@ class ArmContext:
 
     def close(self) -> None:
         if self.hub is not None:
-            (self.out / "v2_snapshot.json").write_text(
+            (self.out / ("v3_snapshot.json" if self.arm == "scas3" else "v2_snapshot.json")).write_text(
                 json.dumps(self.hub.snapshot(), indent=2), encoding="utf-8")
         if self.service is not None:
             (self.out / "coordinator_snapshot.json").write_text(
@@ -579,7 +594,7 @@ V2_BRANCH_NOTE = """- You work in a team on ONE shared train.py. It contains eve
 
 def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: float,
                  model: str) -> None:
-    """Shared-branch loop for the `scas2` arm (see scas/v2.py)."""
+    """Shared-branch loop for the `scas2` and `scas3` arms (scas/v2.py, scas/v3.py)."""
     hub = ctx.hub
     arm = ctx.arm
     tagp = "%s_%s" % (arm, agent)
@@ -630,7 +645,7 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
                 "best_before": None, "version": head})
         log("%s: baseline failed on %s - agent stops" % (tagp, box.name))
         return
-    hub.record_measurement(box.name, head, res["val_bpb"])
+    hub.record_measurement(box.name, head, res["val_bpb"], steps=res.get("num_steps"))
     record({**base_row(0, "baseline, no changes", res, t0, t0), "status": "keep",
             "best_before": None, "version": head})
     log("%s: baseline %.6f on %s" % (tagp, res["val_bpb"], box.name))
@@ -649,7 +664,7 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
         if hub.needs_verification(box.name):
             n += 1
             res = train(n)
-            v = hub.verify(box.name, head, res.get("val_bpb"))
+            v = hub.verify(box.name, head, res.get("val_bpb"), steps=res.get("num_steps"))
             row = base_row(n, "re-measure shared version %d on this box" % idx, res, t_start, t_start)
             row.update(status="verify" if v["ok"] else "verify_fail", kind="verify",
                        best_before=v.get("expected"), version=head, coordinator=v)
@@ -691,16 +706,31 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
             except RuntimeError:
                 merged = False
             if merged:
-                directive = {"kind": "merge", "target": pending["description"], "target_id": None}
+                directive = {"kind": "merge", "target": pending["description"], "target_id": None,
+                             "change_id": pending.get("change_id")}
                 description = "merge: " + pending["description"]
                 claim = hub.claim(agent, box.name, head, git(wd, "diff", "HEAD"),
-                                  description, directive)["claim"]
+                                  description, directive,
+                                  new_code=tp.read_text(encoding="utf-8"))["claim"]
             else:
                 git(wd, "reset", "-q", "--hard", "HEAD")
                 directive = hub.combine_directive(pending["description"], pending["gain_pct"])
+                directive["change_id"] = pending.get("change_id")
             pending = None
         else:
-            directive = hub.next_directive(agent)
+            directive = hub.next_directive(agent, box.name)
+            if directive["kind"] == "model":
+                # the model's own numeric step: no agent call, the hub wrote the edit
+                tp.write_text(directive["new_code"], encoding="utf-8", newline="\n")
+                c = hub.claim(agent, box.name, head, git(wd, "diff", "HEAD"),
+                              directive["description"], directive,
+                              new_code=directive["new_code"])
+                if "claim" not in c:
+                    git(wd, "reset", "-q", "--hard", "HEAD")
+                    hub.release(directive)
+                    time.sleep(2)
+                    continue
+                claim, description = c["claim"], directive["description"]
 
         prop = {}
         if claim is None:
@@ -728,21 +758,24 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
                     git(wd, "reset", "-q", "--hard", "HEAD")
                     break
                 c = hub.claim(agent, box.name, head, git(wd, "diff", "HEAD"),
-                              prop["description"], directive)
+                              prop["description"], directive,
+                              new_code=tp.read_text(encoding="utf-8"))
                 if "claim" in c:
                     claim, description = c["claim"], prop["description"]
                     break
                 dups += 1
                 d = c["duplicate"]
                 git(wd, "reset", "-q", "--hard", "HEAD")
-                feedback = ("\n\nYour previous proposal was refused before running because it "
-                            "repeats an experiment already on the log (%s, status %s):\n    \"%s\"\n"
-                            "Propose something different." % (d["reason"], d["status"], d["card"]))
-                log("%s: duplicate refused (%s): %s" % (tagp, d["reason"], prop["description"][:70]))
+                feedback = "\n\n" + (d.get("message") or (
+                    "Your previous proposal was refused before running because it "
+                    "repeats an experiment already on the log (%s, status %s):\n    \"%s\"\n"
+                    "Propose something different." % (d["reason"], d["status"], d["card"])))
+                log("%s: refused before running (%s, %s): %s"
+                    % (tagp, d["reason"], d["status"], prop["description"][:70]))
             if claim is None:
                 hub.release(directive)
                 failures += 1
-                why = err or "three duplicate proposals in a row"
+                why = err or "three refused proposals in a row"
                 log("%s: proposal failed (%s)" % (tagp, why))
                 with trace.open("a", encoding="utf-8") as f:
                     f.write(json.dumps({"arm": arm, "agent": agent, "proposal_failed": why,
@@ -761,7 +794,7 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
         res = train(n)
         cand_code = tp.read_text(encoding="utf-8")
         t_exp_done = time.time()
-        out = hub.report(claim, res.get("val_bpb"), cand_code)
+        out = hub.report(claim, res.get("val_bpb"), cand_code, steps=res.get("num_steps"))
         recheck_row = None
         if out["status"] == "recheck":
             # lost to an estimate by less than the estimate can be wrong:
@@ -803,8 +836,13 @@ def run_agent_v2(ctx: ArmContext, agent: str, box, workroot: Path, deadline: flo
                 except RuntimeError:
                     pass
             if not adopted:
-                pending = {"diff": diff, "description": desc, "gain_pct": out["gain_pct"]}
+                pending = {"diff": diff, "description": desc, "gain_pct": out["gain_pct"],
+                           "change_id": out.get("change_id")}
             out["adopted"] = adopted
+        elif out["status"] == "uncertain":
+            # the model cannot tell yet whether this helped: run it once more
+            pending = {"diff": diff, "description": description, "gain_pct": out["gain_pct"],
+                       "change_id": out.get("change_id")}
         row = base_row(n, description, res, t_start, t_train)
         row.update(status=out["status"], kind=directive["kind"], best_before=out["ref"],
                    version=head, propose_secs=prop.get("secs"), cost_usd=prop.get("cost_usd"),
@@ -828,7 +866,7 @@ def run_arm(arm: str, agents: list[str], boxes: list, out: Path, workroot: Path,
     adir = out / arm
     adir.mkdir(parents=True, exist_ok=True)
     base_code = None
-    if arm == "scas2":
+    if arm in SHARED_ARMS:
         tmp = adir / "base_train.py"
         boxes[0].fetch_train_py(tmp)
         base_code = tmp.read_text(encoding="utf-8")
@@ -845,7 +883,7 @@ def run_arm(arm: str, agents: list[str], boxes: list, out: Path, workroot: Path,
 
     def guarded(agent, box):
         try:
-            (run_agent_v2 if arm == "scas2" else run_agent)(
+            (run_agent_v2 if arm in SHARED_ARMS else run_agent)(
                 ctx, agent, box, workroot, deadline, model)
         except Exception:  # noqa: BLE001
             log("%s_%s died:\n%s" % (arm, agent, traceback.format_exc()))
@@ -1070,6 +1108,9 @@ def cmd_run(args) -> None:
     swarm_arms = [a for a in arms if a != "single"]
     k = args.agents
     need = (k if swarm_arms else 0) + (1 if "single" in arms else 0)
+    global V3_MEMORY
+    # the remembered experiments are from real GPUs: they would mislead the stub trainer
+    V3_MEMORY = not (args.fake or args.no_memory)
     if args.fake:
         boxes = [FakeBox(i) for i in range(need)]
     else:
@@ -1161,6 +1202,8 @@ def main() -> None:
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--out", default=None)
     sp.add_argument("--fake", action="store_true", help="stub trainer, no GPU")
+    sp.add_argument("--no-memory", action="store_true", dest="no_memory",
+                    help="scas3 starts with an empty model instead of the remembered runs")
     sp.add_argument("--keep", action="store_true", help="do not destroy the boxes")
     sp.set_defaults(func=cmd_run)
 
