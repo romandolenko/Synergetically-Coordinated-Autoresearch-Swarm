@@ -65,7 +65,7 @@ def rows_of(adir: Path) -> list[dict]:
     return out
 
 
-def replay_run(rd: Path, base: str, rp: Replayer) -> tuple[list[dict], int]:
+def replay_run(rd: Path, base: str, rp: Replayer, with_code: bool = False) -> tuple[list[dict], int]:
     data, fails = [], 0
     rest0 = extract(base)[1]
     for armdir in sorted(p for p in rd.iterdir() if p.is_dir()):
@@ -136,6 +136,8 @@ def replay_run(rd: Path, base: str, rp: Replayer) -> tuple[list[dict], int]:
                 "consts": consts, "flags": [] if rest == rest0 else ["rest:" + rest],
                 "code_hash": code_hash(code), "desc": r["description"][:120],
             })
+            if with_code:
+                data[-1]["code"] = code
     return data, fails
 
 
